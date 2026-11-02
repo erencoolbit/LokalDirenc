@@ -17,6 +17,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import org.lokaldirenc.core.BleAdvert
 import org.lokaldirenc.core.Node
 import org.lokaldirenc.core.WatchdogLink
 import java.io.IOException
@@ -35,8 +36,8 @@ import kotlin.concurrent.thread
  * Sistem soru sormaz: "insecure" kanal Bluetooth eşleştirmesi istemez, gizlilik ve üyelik
  * Noise ile sağlanır. Yalnız mesh zarfları taşınır, dosya aktarımı IP bağlantısı ister.
  *
- * Reklamda sabit kimlik yoktur: 128 bitlik belirteç 10 dakikada bir değişir, üye olmayan
- * için rastgele görünür. L2CAP kanal numarası düz metindir ve anlamı yoktur.
+ * Reklamda sabit kimlik yoktur: belirteç 10 dakikada bir değişir, üye olmayan için rastgele
+ * görünür. Biçim için bkz. BleAdvert; iOS'un yayınlayabildiği tek hizmet kimliğine sığar.
  */
 @SuppressLint("MissingPermission")
 class BleTransport(private val context: Context, private val onChange: () -> Unit) {
@@ -196,6 +197,7 @@ class BleTransport(private val context: Context, private val onChange: () -> Uni
         val le = a.bluetoothLeAdvertiser ?: return
         link.advertiser?.let { runCatching { le.stopAdvertising(it) } }
         val token = n.bleTokens(id, epoch, 0).singleOrNull() ?: return
+        val advert = BleAdvert.encode(token, link.psm, ByteBuffer.wrap(roleTag).int)
         val callback = object : AdvertiseCallback() {
             override fun onStartFailure(errorCode: Int) {
                 // Sistem reklam yuvası dolu olabilir: bir sonraki turda yeniden denenir.
@@ -210,7 +212,7 @@ class BleTransport(private val context: Context, private val onChange: () -> Uni
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
-            .addServiceData(ParcelUuid(uuidOf(token)), ByteBuffer.allocate(PAYLOAD).putShort(link.psm.toShort()).put(roleTag).array())
+            .addServiceUuid(ParcelUuid(uuidOf(advert)))
             .build()
         link.advertiser = callback
         link.epoch = epoch
@@ -221,34 +223,32 @@ class BleTransport(private val context: Context, private val onChange: () -> Uni
 
     private fun handle(result: ScanResult) {
         val n = node ?: return
-        val serviceData = result.scanRecord?.serviceData ?: return
-        for ((uuid, payload) in serviceData) {
-            if (payload.size != PAYLOAD) continue
-            val network = networkFor(n, uuid.uuid) ?: continue
-            val buffer = ByteBuffer.wrap(payload)
-            val psm = buffer.short.toInt() and 0xFFFF
-            val peerTag = Integer.toUnsignedLong(buffer.int)
+        val uuids = result.scanRecord?.serviceUuids ?: return
+        for (uuid in uuids) {
+            val raw = ByteBuffer.allocate(BleAdvert.SIZE).putLong(uuid.uuid.mostSignificantBits).putLong(uuid.uuid.leastSignificantBits).array()
+            val advert = BleAdvert.decode(raw) ?: continue
+            val network = networkFor(n, advert.token) ?: continue
             seenDevices[result.device.address] = System.currentTimeMillis()
-            if (Integer.toUnsignedLong(ByteBuffer.wrap(roleTag).int) > peerTag) maybeDial(n, network, result, psm)
+            if (Integer.toUnsignedLong(ByteBuffer.wrap(roleTag).int) > advert.role) maybeDial(n, network, result, advert.psm)
         }
     }
 
     /** Tarama saniyede çok sonuç verebilir: belirteçler dönem başına bir kez hesaplanır. */
-    private fun networkFor(n: Node, uuid: UUID): String? {
+    private fun networkFor(n: Node, token: ByteArray): String? {
         val epoch = epochNow()
         val ids = n.networks().map { it.id }
         val cached = tokenCache
         val table = if (cached != null && cached.epoch == epoch && cached.networks == ids) {
             cached.tokens
         } else {
-            ids.flatMap { id -> n.bleTokens(id, epoch, EPOCH_TOLERANCE).map { uuidOf(it) to id } }.toMap().also {
+            ids.flatMap { id -> n.bleTokens(id, epoch, EPOCH_TOLERANCE).map { it.toList() to id } }.toMap().also {
                 tokenCache = TokenCache(epoch, ids, it)
             }
         }
-        return table[uuid]
+        return table[token.toList()]
     }
 
-    private class TokenCache(val epoch: Long, val networks: List<String>, val tokens: Map<UUID, String>)
+    private class TokenCache(val epoch: Long, val networks: List<String>, val tokens: Map<List<Byte>, String>)
 
     @Volatile
     private var tokenCache: TokenCache? = null
@@ -288,7 +288,6 @@ class BleTransport(private val context: Context, private val onChange: () -> Uni
         // Bekleyen taraftaki yeni mesaj en geç bu sürede karşıya geçer.
         const val RESYNC_MS = 30_000L
         const val MIN_GAP_MS = 10_000L
-        const val PAYLOAD = 6
         const val TAG = "LokalDirencBle"
     }
 }

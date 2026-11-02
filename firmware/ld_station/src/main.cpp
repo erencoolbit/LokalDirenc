@@ -19,7 +19,8 @@
 static const char* SERVICE_UUID = "4c442d4c-4f52-4100-8000-000000000001";
 static const char* TX_UUID = "4c442d4c-4f52-4100-8000-000000000002";
 static const char* RX_UUID = "4c442d4c-4f52-4100-8000-000000000003";
-static const char* SOS_UUID = "4c442d53-4f53-4000-8000-000000000001";
+// SOS reklami tek hizmet kimligidir: [sabit onek 10][surum 1][oturum 4][pil 1]. Bkz. docs/PROTOKOL.md
+static const uint8_t SOS_PREFIX[10] = {0x4c, 0x44, 0x2d, 0x53, 0x4f, 0x53, 0x40, 0x00, 0x80, 0x00};
 
 static const uint8_t KIND_SOS = 2;
 static const uint8_t SOS_TTL = 2;
@@ -169,11 +170,23 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 // Telefon SOS yayını duyulunca LoRa'ya aktarılır. Oturum başına aralıklı: kanalı doldurmasın.
 class SosScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* device) override {
-        NimBLEUUID uuid(SOS_UUID);
-        std::string data = device->getServiceData(uuid);
-        if (data.size() != SOS_SIZE || data[0] != 1) return;
+        uint8_t sos[SOS_SIZE];
+        bool found = false;
+        for (uint8_t i = 0; i < device->getServiceUUIDCount() && !found; i++) {
+            NimBLEUUID uuid = device->getServiceUUID(i);
+            if (uuid.bitSize() != BLE_UUID_TYPE_128) continue;
+            // NimBLE baytlari ters sirada tutar.
+            const uint8_t* raw = uuid.getNative()->u128.value;
+            uint8_t value[16];
+            for (int k = 0; k < 16; k++) value[k] = raw[15 - k];
+            if (memcmp(value, SOS_PREFIX, sizeof(SOS_PREFIX)) == 0 && value[10] == 1) {
+                memcpy(sos, value + 10, SOS_SIZE);
+                found = true;
+            }
+        }
+        if (!found) return;
         uint32_t session;
-        memcpy(&session, data.data() + 1, 4);
+        memcpy(&session, sos + 1, 4);
         uint32_t now = millis();
         size_t oldest = 0;
         for (size_t i = 0; i < 16; i++) {
@@ -188,7 +201,7 @@ class SosScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         uint8_t frame[2 + SOS_SIZE + 1];
         frame[0] = SOS_TTL;
         frame[1] = KIND_SOS;
-        memcpy(frame + 2, data.data(), SOS_SIZE);
+        memcpy(frame + 2, sos, SOS_SIZE);
         frame[2 + SOS_SIZE] = (int8_t)device->getRSSI();
         alreadySeen(frameHash(frame, sizeof(frame)));
         enqueue(frame, sizeof(frame));

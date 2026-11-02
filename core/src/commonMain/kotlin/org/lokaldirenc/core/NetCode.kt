@@ -1,11 +1,5 @@
 package org.lokaldirenc.core
 
-import org.bouncycastle.crypto.digests.SHA256Digest
-import org.bouncycastle.crypto.generators.HKDFBytesGenerator
-import org.bouncycastle.crypto.params.HKDFParameters
-import java.security.MessageDigest
-import java.security.SecureRandom
-
 /**
  * Yönetimsiz ağ kodu (Bölüm 6.3): 26 karakter Base32 = 130 bit rastgelelik.
  * Elle girişte yazım hatası sessizce başka bir ağa götürmesin diye sona 2 karakter
@@ -16,8 +10,9 @@ object NetCode {
     private const val BODY = 26
     private const val QR_PREFIX = "ld://join?v=1&c="
 
-    fun generate(random: SecureRandom = SecureRandom()): String {
-        val body = String(CharArray(BODY) { ALPHABET[random.nextInt(ALPHABET.length)] })
+    fun generate(): String {
+        // 32 harfli alfabe: 5 bit tam eşleşir, sapma olmaz.
+        val body = platformCrypto.randomBytes(BODY).map { ALPHABET[it.toInt() and 31] }.joinToString("")
         return body + checksum(body)
     }
 
@@ -40,7 +35,7 @@ object NetCode {
     fun parse(text: String): String = normalize(text.trim().removePrefix(QR_PREFIX))
 
     /** Network ID = Hash("LD-NET-v1-U" + ağ kodu). Kamuya açık sayılır, koddan geri dönülemez. */
-    fun networkId(code: String): ByteArray = sha256("LD-NET-v1-U".toByteArray() + body(code).toByteArray())
+    fun networkId(code: String): ByteArray = sha256("LD-NET-v1-U".encodeToByteArray() + body(code).encodeToByteArray())
 
     /** Noise el sıkışmasının ön paylaşımlı anahtarı. */
     fun psk(code: String): ByteArray = derive(code, "LD-PSK-v1")
@@ -52,56 +47,44 @@ object NetCode {
     fun loraKey(code: String): ByteArray = derive(code, "LD-LORA-v1")
 
     /**
-     * BLE reklamındaki 128 bitlik dönen belirteç. Üye olmayan için rastgele veridir, dönemler
+     * BLE reklamındaki dönen belirteç (80 bit). Üye olmayan için rastgele veridir, dönemler
      * arasında bağlanamaz. Dönem cihaz saatinden gelir; bu yüzden yakın dönemler de kabul edilir.
      */
-    fun bleToken(discoveryKey: ByteArray, epoch: Long): ByteArray {
-        val mac = org.bouncycastle.crypto.macs.HMac(SHA256Digest())
-        mac.init(org.bouncycastle.crypto.params.KeyParameter(discoveryKey))
-        val message = "LD-BLE-v1|$epoch".toByteArray()
-        mac.update(message, 0, message.size)
-        return ByteArray(32).also { mac.doFinal(it, 0) }.copyOf(16)
-    }
+    fun bleToken(discoveryKey: ByteArray, epoch: Long): ByteArray =
+        platformCrypto.hmacSha256(discoveryKey, "LD-BLE-v1|$epoch".encodeToByteArray()).copyOf(BleAdvert.TOKEN)
 
     private fun body(code: String) = code.take(BODY)
 
-    private fun derive(code: String, info: String): ByteArray {
-        val hkdf = HKDFBytesGenerator(SHA256Digest())
-        hkdf.init(HKDFParameters(body(code).toByteArray(), null, info.toByteArray()))
-        return ByteArray(32).also { hkdf.generateBytes(it, 0, 32) }
-    }
+    private fun derive(code: String, info: String): ByteArray =
+        platformCrypto.hkdfSha256(body(code).encodeToByteArray(), info.encodeToByteArray(), 32)
 
     private fun checksum(body: String): String {
-        val digest = sha256("LD-CHK-v1".toByteArray() + body.toByteArray())
+        val digest = sha256("LD-CHK-v1".encodeToByteArray() + body.encodeToByteArray())
         val bits = ((digest[0].toInt() and 0xFF) shl 2) or ((digest[1].toInt() and 0xFF) ushr 6)
         return "${ALPHABET[bits ushr 5]}${ALPHABET[bits and 31]}"
     }
 }
 
-internal fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
+/**
+ * Bluetooth reklamı tek bir 128 bitlik hizmet kimliğine sığar: [belirteç 10][kanal 2][rol 4].
+ * iOS uygulamaları reklamda "service data" yayınlayamaz, ama hizmet kimliği yayınlayabilir;
+ * Android de aynısını okur. Rol etiketi, iki cihazın aynı anda birbirini aramasını önler.
+ */
+object BleAdvert {
+    const val TOKEN = 10
+    const val SIZE = 16
 
-internal fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
+    class Decoded(val token: ByteArray, val psm: Int, val role: Long)
 
-internal fun String.unhex(): ByteArray {
-    require(length % 2 == 0) { "hex uzunluğu" }
-    return ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }
-}
-
-/** Kısa ve okunabilir gösterim: parmak izi ve doğrulama kodu için. */
-internal fun base32(data: ByteArray, chars: Int): String {
-    val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    val out = StringBuilder()
-    var buffer = 0
-    var bits = 0
-    for (b in data) {
-        buffer = (buffer shl 8) or (b.toInt() and 0xFF)
-        bits += 8
-        while (bits >= 5 && out.length < chars) {
-            bits -= 5
-            out.append(alphabet[(buffer ushr bits) and 31])
-        }
-        buffer = buffer and 0xFF
-        if (out.length == chars) break
+    fun encode(token: ByteArray, psm: Int, role: Int): ByteArray {
+        require(token.size == TOKEN) { "belirteç boyutu" }
+        require(psm in 0..0xFFFF) { "kanal numarası" }
+        return ByteWriter(SIZE).bytes(token).short(psm).int(role).toByteArray()
     }
-    return out.toString()
+
+    fun decode(data: ByteArray): Decoded? {
+        if (data.size != SIZE) return null
+        val reader = ByteReader(data)
+        return Decoded(reader.bytes(TOKEN), reader.short(), reader.int().toLong() and 0xFFFFFFFFL)
+    }
 }

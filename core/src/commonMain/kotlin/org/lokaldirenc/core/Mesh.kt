@@ -4,12 +4,11 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
-import java.nio.ByteBuffer
-import java.security.SecureRandom
-import java.util.Base64
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+import kotlin.concurrent.Volatile
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 
 /** Ağ üzerinde taşınan zarf. Taşıyan cihaz bunu doğrular, saklar ve iletir. */
 @Serializable
@@ -65,11 +64,14 @@ data class MeshPersist(
  * bunları okuyabilir. Özel mesaj Noise_X ile mühürlüdür: alıcı, gönderen ve içerik ara
  * cihazlara görünmez; alıcı her mührü açmayı dener.
  */
-class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: () -> Long = System::currentTimeMillis) {
+@OptIn(ExperimentalEncodingApi::class)
+class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: () -> Long = ::currentTimeMillis) {
+    private val lock = SynchronizedObject()
+
     private class Identity(networkId: ByteArray, edPrivate: ByteArray, val boxPriv: ByteArray) {
         val networkId = networkId
-        val ed = Ed25519PrivateKeyParameters(edPrivate, 0)
-        val edPub = ed.generatePublicKey().encoded
+        val ed = edPrivate
+        val edPub = platformCrypto.ed25519PublicOf(edPrivate)
         val id = sha256(edPub).hex()
         val boxPub = Noise.publicOf(boxPriv)
     }
@@ -101,66 +103,60 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
     var dirty = false
         private set
 
-    @Synchronized
     fun load(state: Map<String, MeshPersist>) {
-        persisted = state
+        synchronized(lock) {
+            persisted = state
+        }
     }
 
-    @Synchronized
     fun register(networkId: String, networkIdBytes: ByteArray, edPrivate: ByteArray, boxPrivate: ByteArray, nick: String) {
-        val net = Net(Identity(networkIdBytes, edPrivate, boxPrivate), persisted[networkId])
-        nets[networkId] = net
-        announce(networkId, nick)
+        synchronized(lock) {
+            val net = Net(Identity(networkIdBytes, edPrivate, boxPrivate), persisted[networkId])
+            nets[networkId] = net
+            announce(networkId, nick)
+        }
     }
 
-    @Synchronized
     fun remove(networkId: String) {
-        nets.remove(networkId)
-        dirty = true
+        synchronized(lock) {
+            nets.remove(networkId)
+            dirty = true
+        }
     }
 
-    @Synchronized
     fun announce(networkId: String, nick: String) {
-        val net = nets[networkId] ?: return
-        net.ownNick = nick
-        val body = JSON.encodeToString(Presence(net.identity.boxPub.hex(), nick)).toByteArray()
-        val wire = signed(net, KIND_PRESENCE, body)
-        net.selfPresence = wire
-        ingest(networkId, wire)
+        synchronized(lock) {
+            val net = nets[networkId] ?: return
+            net.ownNick = nick
+            val body = JSON.encodeToString(Presence(net.identity.boxPub.hex(), nick)).encodeToByteArray()
+            val wire = signed(net, KIND_PRESENCE, body)
+            net.selfPresence = wire
+            ingest(networkId, wire)
+        }
     }
 
-    @Synchronized
-    fun presenceAge(networkId: String): Long = now() - (nets[networkId]?.selfPresence?.issuedAt ?: 0)
+    fun presenceAge(networkId: String): Long = synchronized(lock) { now() - (nets[networkId]?.selfPresence?.issuedAt ?: 0) }
 
     private fun signed(net: Net, kind: String, body: ByteArray): MeshWire {
         val issuedAt = now()
-        val encoded = Base64.getEncoder().encodeToString(body)
-        val signer = Ed25519Signer()
-        signer.init(true, net.identity.ed)
-        val message = canonical(net.identity.networkId, kind, issuedAt, encoded)
-        signer.update(message, 0, message.size)
-        return MeshWire(kind, issuedAt, encoded, net.identity.edPub.hex(), signer.generateSignature().hex(), MAX_HOPS)
+        val encoded = Base64.encode(body)
+        val signature = platformCrypto.ed25519Sign(net.identity.ed, canonical(net.identity.networkId, kind, issuedAt, encoded))
+        return MeshWire(kind, issuedAt, encoded, net.identity.edPub.hex(), signature.hex(), MAX_HOPS)
     }
 
     private fun canonical(networkId: ByteArray, kind: String, issuedAt: Long, body: String): ByteArray =
-        "LD-MESH-1|".toByteArray() + networkId + "|$kind|$issuedAt|$body".toByteArray()
+        "LD-MESH-1|".encodeToByteArray() + networkId + "|$kind|$issuedAt|$body".encodeToByteArray()
 
     private fun envelopeId(net: Net, w: MeshWire): String =
-        sha256(canonical(net.identity.networkId, w.kind, w.issuedAt, w.body) + w.author.toByteArray() + w.sig.toByteArray()).hex()
+        sha256(canonical(net.identity.networkId, w.kind, w.issuedAt, w.body) + w.author.encodeToByteArray() + w.sig.encodeToByteArray()).hex()
 
     private fun verified(net: Net, w: MeshWire): Boolean = try {
-        val signer = Ed25519Signer()
-        signer.init(false, Ed25519PublicKeyParameters(w.author.unhex(), 0))
-        val message = canonical(net.identity.networkId, w.kind, w.issuedAt, w.body)
-        signer.update(message, 0, message.size)
-        signer.verifySignature(w.sig.unhex())
+        platformCrypto.ed25519Verify(w.author.unhex(), w.sig.unhex(), canonical(net.identity.networkId, w.kind, w.issuedAt, w.body))
     } catch (_: IllegalArgumentException) {
-        false
-    } catch (_: IndexOutOfBoundsException) {
         false
     }
 
-    private fun decode(w: MeshWire): ByteArray? = runCatching { Base64.getDecoder().decode(w.body) }.getOrNull()
+    private fun decode(w: MeshWire): ByteArray? = runCatching { Base64.decode(w.body) }.getOrNull()
 
     private fun cleanText(text: String) =
         text.filter { (!it.isISOControl() || it == '\n') && it.code !in 0x202A..0x202E && it.code !in 0x2066..0x2069 }.trim().take(MAX_TEXT)
@@ -169,38 +165,39 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         nick.filter { !it.isISOControl() && it.code !in 0x202A..0x202E && it.code !in 0x2066..0x2069 }.trim().take(32)
 
     /** Gelen zarfı doğrular ve saklar. Yeni ve geçerliyse true. Geçersiz zarf iletilmez. */
-    @Synchronized
     fun ingest(networkId: String, w: MeshWire): Boolean {
-        val net = nets[networkId] ?: return false
-        val time = now()
-        if (w.body.length > MAX_BODY || w.hops !in 0..MAX_HOPS) return false
-        // Saat güvenilmez, bu yalnız bir tutarlılık sınırıdır: çok eski zarflar geri dönmesin.
-        if (w.issuedAt < time - MAX_AGE_MS || w.issuedAt > time + MAX_FUTURE_MS) return false
-        val id = envelopeId(net, w)
-        if (id in net.seen) return false
-        val accepted = when (w.kind) {
-            KIND_PRESENCE -> verified(net, w) && acceptPresence(net, w)
-            KIND_PUBLIC -> verified(net, w) && acceptPublic(net, id, w)
-            KIND_DIRECT -> {
-                if (w.author.isNotEmpty() || w.sig.isNotEmpty()) false else {
-                    tryOpenDirect(net, id, w)
-                    true
+        return synchronized(lock) {
+            val net = nets[networkId] ?: return false
+            val time = now()
+            if (w.body.length > MAX_BODY || w.hops !in 0..MAX_HOPS) return false
+            // Saat güvenilmez, bu yalnız bir tutarlılık sınırıdır: çok eski zarflar geri dönmesin.
+            if (w.issuedAt < time - MAX_AGE_MS || w.issuedAt > time + MAX_FUTURE_MS) return false
+            val id = envelopeId(net, w)
+            if (id in net.seen) return false
+            val accepted = when (w.kind) {
+                KIND_PRESENCE -> verified(net, w) && acceptPresence(net, w)
+                KIND_PUBLIC -> verified(net, w) && acceptPublic(net, id, w)
+                KIND_DIRECT -> {
+                    if (w.author.isNotEmpty() || w.sig.isNotEmpty()) false else {
+                        tryOpenDirect(net, id, w)
+                        true
+                    }
                 }
+                else -> false
             }
-            else -> false
+            if (!accepted) return false
+            remember(net, id)
+            // Engellenen içerik gösterilmez ve başkasına aktarılmaz (Bölüm 13.1).
+            if (w.author.isNotEmpty() && isBlocked(sha256(w.author.unhex()).hex())) return false
+            if (w.kind == KIND_PRESENCE) {
+                net.envelopes.values.removeAll { it.wire.kind == KIND_PRESENCE && it.wire.author == w.author }
+            }
+            net.envelopes[id] = MeshStored(id, w, time)
+            enforceQuota(net, w)
+            net.version++
+            dirty = true
+            return true
         }
-        if (!accepted) return false
-        remember(net, id)
-        // Engellenen içerik gösterilmez ve başkasına aktarılmaz (Bölüm 13.1).
-        if (w.author.isNotEmpty() && isBlocked(sha256(w.author.unhex()).hex())) return false
-        if (w.kind == KIND_PRESENCE) {
-            net.envelopes.values.removeIf { it.wire.kind == KIND_PRESENCE && it.wire.author == w.author }
-        }
-        net.envelopes[id] = MeshStored(id, w, time)
-        enforceQuota(net, w)
-        net.version++
-        dirty = true
-        return true
     }
 
     private fun remember(net: Net, id: String) {
@@ -239,14 +236,14 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
     private fun parsePresence(w: MeshWire): Presence? {
         if (w.kind != KIND_PRESENCE) return null
         val raw = decode(w) ?: return null
-        val p = runCatching { JSON.decodeFromString<Presence>(String(raw)) }.getOrNull() ?: return null
+        val p = runCatching { JSON.decodeFromString<Presence>(raw.decodeToString()) }.getOrNull() ?: return null
         if (p.box.length != 64 || runCatching { p.box.unhex() }.isFailure) return null
         return p
     }
 
     private fun acceptPublic(net: Net, id: String, w: MeshWire): Boolean {
         val raw = decode(w) ?: return false
-        val body = runCatching { JSON.decodeFromString<PublicBody>(String(raw)) }.getOrNull() ?: return false
+        val body = runCatching { JSON.decodeFromString<PublicBody>(raw.decodeToString()) }.getOrNull() ?: return false
         val text = cleanText(body.text)
         if (text.isEmpty()) return false
         val from = sha256(w.author.unhex()).hex()
@@ -265,7 +262,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
             return
         }
         val plain = unpad(opened.plain) ?: return
-        val body = runCatching { JSON.decodeFromString<DirectBody>(String(plain)) }.getOrNull() ?: return
+        val body = runCatching { JSON.decodeFromString<DirectBody>(plain.decodeToString()) }.getOrNull() ?: return
         if (!verified(net, body.presence)) return
         val presence = parsePresence(body.presence) ?: return
         // Gönderen anahtarı Noise ile kanıtlı; imzalı duyuruda aynı anahtar yazmalı.
@@ -285,7 +282,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         dirty = true
     }
 
-    private fun sealPrologue(net: Net) = "LD-MESH-1|".toByteArray() + net.identity.networkId
+    private fun sealPrologue(net: Net) = "LD-MESH-1|".encodeToByteArray() + net.identity.networkId
 
     private fun trimMessages(net: Net) {
         val extra = net.messages.size - MAX_MESSAGES
@@ -295,12 +292,12 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
     /** Boyut sızmasın diye düz metin 512 baytın katına doldurulur. */
     private fun pad(data: ByteArray): ByteArray {
         val total = ((data.size + 2 + PAD_UNIT - 1) / PAD_UNIT) * PAD_UNIT
-        return ByteBuffer.allocate(total).putShort(data.size.toShort()).put(data).array()
+        return ByteWriter(total).short(data.size).bytes(data).toByteArray().copyOf(total)
     }
 
     private fun unpad(data: ByteArray): ByteArray? {
         if (data.size < 2) return null
-        val size = ByteBuffer.wrap(data).short.toInt() and 0xFFFF
+        val size = ByteReader(data).short()
         if (size > data.size - 2) return null
         return data.copyOfRange(2, 2 + size)
     }
@@ -310,32 +307,34 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
     fun sendDirect(networkId: String, contactId: String, text: String): Boolean = publishDirect(networkId, contactId, text) != null
 
     /** Gönderilen zarfı döner; LoRa gibi başka bir yoldan da yayınlanabilsin diye. */
-    @Synchronized
     fun publishPublic(networkId: String, text: String): MeshWire? {
-        val net = nets[networkId] ?: return null
-        val clean = cleanText(text)
-        if (clean.isEmpty()) return null
-        val wire = signed(net, KIND_PUBLIC, JSON.encodeToString(PublicBody(clean)).toByteArray())
-        return wire.takeIf { ingest(networkId, it) }
+        return synchronized(lock) {
+            val net = nets[networkId] ?: return null
+            val clean = cleanText(text)
+            if (clean.isEmpty()) return null
+            val wire = signed(net, KIND_PUBLIC, JSON.encodeToString(PublicBody(clean)).encodeToByteArray())
+            return wire.takeIf { ingest(networkId, it) }
+        }
     }
 
-    @Synchronized
     fun publishDirect(networkId: String, contactId: String, text: String): MeshWire? {
-        val net = nets[networkId] ?: return null
-        val contact = net.contacts[contactId] ?: return null
-        val clean = cleanText(text)
-        val presence = net.selfPresence
-        if (clean.isEmpty() || presence == null) return null
-        val plain = JSON.encodeToString(DirectBody(presence, clean)).toByteArray()
-        val sealed = Noise.seal(contact.box.unhex(), net.identity.boxPriv, sealPrologue(net), pad(plain))
-        // Karıştırılmış zaman: sıra ve gönderim anı ara cihazlara daha az şey söylesin.
-        val issuedAt = now() - RANDOM.nextInt(JITTER_MS)
-        val wire = MeshWire(KIND_DIRECT, issuedAt, Base64.getEncoder().encodeToString(sealed), hops = MAX_HOPS)
-        if (!ingest(networkId, wire)) return null
-        net.messages += MeshMessage(envelopeId(net, wire), true, net.identity.id, net.ownNick, contactId, clean, now(), 0, true)
-        trimMessages(net)
-        dirty = true
-        return wire
+        return synchronized(lock) {
+            val net = nets[networkId] ?: return null
+            val contact = net.contacts[contactId] ?: return null
+            val clean = cleanText(text)
+            val presence = net.selfPresence
+            if (clean.isEmpty() || presence == null) return null
+            val plain = JSON.encodeToString(DirectBody(presence, clean)).encodeToByteArray()
+            val sealed = Noise.seal(contact.box.unhex(), net.identity.boxPriv, sealPrologue(net), pad(plain))
+            // Karıştırılmış zaman: sıra ve gönderim anı ara cihazlara daha az şey söylesin.
+            val issuedAt = now() - randomJitter()
+            val wire = MeshWire(KIND_DIRECT, issuedAt, Base64.encode(sealed), hops = MAX_HOPS)
+            if (!ingest(networkId, wire)) return null
+            net.messages += MeshMessage(envelopeId(net, wire), true, net.identity.id, net.ownNick, contactId, clean, now(), 0, true)
+            trimMessages(net)
+            dirty = true
+            return wire
+        }
     }
 
     /**
@@ -343,80 +342,81 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
      * kutu anahtarıyla eşleşiyorsa anahtarın sahibi kanıtlanmıştır. Başkasının kutu anahtarını
      * kendi duyurusuna yazan üye, "doğrulandı" etiketini böylece alamaz.
      */
-    @Synchronized
     fun acceptLinkPresence(networkId: String, w: MeshWire?, linkFingerprint: String) {
-        val net = nets[networkId] ?: return
-        if (w == null || !verified(net, w)) return
-        val p = parsePresence(w) ?: return
-        ingest(networkId, w)
-        if (sha256(p.box.unhex()).hex() != linkFingerprint) return
-        val id = sha256(w.author.unhex()).hex()
-        net.contacts[id]?.takeIf { it.box == p.box && !it.proven }?.let {
-            net.contacts[id] = it.copy(proven = true)
-            dirty = true
-            net.version++
+        synchronized(lock) {
+            val net = nets[networkId] ?: return
+            if (w == null || !verified(net, w)) return
+            val p = parsePresence(w) ?: return
+            ingest(networkId, w)
+            if (sha256(p.box.unhex()).hex() != linkFingerprint) return
+            val id = sha256(w.author.unhex()).hex()
+            net.contacts[id]?.takeIf { it.box == p.box && !it.proven }?.let {
+                net.contacts[id] = it.copy(proven = true)
+                dirty = true
+                net.version++
+            }
         }
     }
 
     /** İletilebilir zarfların kimlikleri. */
-    @Synchronized
-    fun inventory(networkId: String): List<String> =
+    fun inventory(networkId: String): List<String> = synchronized(lock) {
         nets[networkId]?.envelopes?.values?.filter { it.wire.hops > 0 }?.map { it.id } ?: emptyList()
+    }
 
     /** Karşı tarafın istediği zarflar; atlama hakkı bir azaltılmış olarak. */
-    @Synchronized
     fun outgoing(networkId: String, ids: Collection<String>): List<MeshWire> {
-        val net = nets[networkId] ?: return emptyList()
-        return ids.mapNotNull { id -> net.envelopes[id]?.wire?.takeIf { it.hops > 0 }?.let { it.copy(hops = it.hops - 1) } }
+        return synchronized(lock) {
+            val net = nets[networkId] ?: return emptyList()
+            return ids.mapNotNull { id -> net.envelopes[id]?.wire?.takeIf { it.hops > 0 }?.let { it.copy(hops = it.hops - 1) } }
+        }
     }
 
-    @Synchronized
-    fun selfPresence(networkId: String): MeshWire? = nets[networkId]?.selfPresence
+    fun selfPresence(networkId: String): MeshWire? = synchronized(lock) { nets[networkId]?.selfPresence }
 
-    @Synchronized
-    fun version(networkId: String): Long = nets[networkId]?.version ?: 0
+    fun version(networkId: String): Long = synchronized(lock) { nets[networkId]?.version ?: 0 }
 
-    @Synchronized
-    fun contacts(networkId: String): List<MeshContact> = nets[networkId]?.contacts?.values?.sortedBy { it.nick } ?: emptyList()
+    fun contacts(networkId: String): List<MeshContact> = synchronized(lock) { nets[networkId]?.contacts?.values?.sortedBy { it.nick } ?: emptyList() }
 
-    @Synchronized
     fun messages(networkId: String): List<MeshMessage> {
-        val net = nets[networkId] ?: return emptyList()
-        return net.messages.map { m -> if (m.fromNick.isEmpty()) m.copy(fromNick = net.contacts[m.fromId]?.nick ?: "") else m }
+        return synchronized(lock) {
+            val net = nets[networkId] ?: return emptyList()
+            return net.messages.map { m -> if (m.fromNick.isEmpty()) m.copy(fromNick = net.contacts[m.fromId]?.nick ?: "") else m }
+        }
     }
 
-    @Synchronized
-    fun carriedCount(networkId: String): Int = nets[networkId]?.envelopes?.values?.count { it.wire.kind != KIND_PRESENCE } ?: 0
+    fun carriedCount(networkId: String): Int = synchronized(lock) { nets[networkId]?.envelopes?.values?.count { it.wire.kind != KIND_PRESENCE } ?: 0 }
 
-    @Synchronized
-    fun ownId(networkId: String): String? = nets[networkId]?.identity?.id
+    fun ownId(networkId: String): String? = synchronized(lock) { nets[networkId]?.identity?.id }
 
     /** Engellenen yazarın saklanan içeriği ve görünen mesajları kaldırılır. */
-    @Synchronized
     fun dropAuthor(id: String) {
-        for (net in nets.values) {
-            net.envelopes.values.removeIf { it.wire.author.isNotEmpty() && sha256(it.wire.author.unhex()).hex() == id }
-            net.messages.removeIf { it.fromId == id }
-            net.version++
+        synchronized(lock) {
+            for (net in nets.values) {
+                net.envelopes.values.removeAll { it.wire.author.isNotEmpty() && sha256(it.wire.author.unhex()).hex() == id }
+                net.messages.removeAll { it.fromId == id }
+                net.version++
+            }
+            dirty = true
         }
-        dirty = true
     }
 
-    @Synchronized
     fun purge(retentionMs: Long) {
-        val time = now()
-        for (net in nets.values) {
-            net.envelopes.values.removeIf { time - it.receivedAt > MAX_AGE_MS || time - it.wire.issuedAt > MAX_AGE_MS }
-            net.messages.removeIf { time - it.at > retentionMs }
+        synchronized(lock) {
+            val time = now()
+            for (net in nets.values) {
+                net.envelopes.values.removeAll { time - it.receivedAt > MAX_AGE_MS || time - it.wire.issuedAt > MAX_AGE_MS }
+                net.messages.removeAll { time - it.at > retentionMs }
+            }
+            dirty = true
         }
-        dirty = true
     }
 
-    @Synchronized
     fun export(): Map<String, MeshPersist> {
-        dirty = false
-        return nets.mapValues { (_, n) ->
-            MeshPersist(n.envelopes.values.toList(), n.seen.toList(), n.contacts.values.toList(), n.messages.toList())
+        return synchronized(lock) {
+            dirty = false
+            return nets.mapValues { (_, n) ->
+                MeshPersist(n.envelopes.values.toList(), n.seen.toList(), n.contacts.values.toList(), n.messages.toList())
+            }
         }
     }
 
@@ -438,8 +438,9 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         const val KIND_PUBLIC = "public"
         const val KIND_DIRECT = "direct"
         private val JSON = Json { ignoreUnknownKeys = true }
-        private val RANDOM = SecureRandom()
 
-        fun generateSigningKey(): ByteArray = Ed25519PrivateKeyParameters(SecureRandom()).encoded
+        fun generateSigningKey(): ByteArray = platformCrypto.ed25519GeneratePrivate()
+
+        private fun randomJitter(): Int = (ByteReader(platformCrypto.randomBytes(4)).int() and Int.MAX_VALUE) % JITTER_MS
     }
 }

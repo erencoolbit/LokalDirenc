@@ -40,7 +40,7 @@ Ne yapıldı: Dağıtılan APK önceden debug imzalı ve `debuggable` idi; artı
 
 | Yer | İçerik |
 |---|---|
-| `core/` | Android'e bağımlı olmayan çekirdek: ağ kodu, Noise, keşif, aktarım, dosya güvenliği |
+| `core/` | Kotlin Multiplatform çekirdek. `commonMain`: platformdan bağımsız protokol; `jvmMain`: soket, dosya ve BouncyCastle ([docs/PROTOKOL.md](docs/PROTOKOL.md)) |
 | `app/` | Compose arayüzü, Keystore deposu, QR |
 | `core/.../cli/Peer.kt` | Geliştirici aracı: emülatörle denemede karşı cihaz rolü. Kodları otomatik onaylar, durumu şifresiz yazar |
 | `tools/gen_noise_vectors.py` | Bağımsız Noise uygulamasından test vektörü üretir |
@@ -94,14 +94,14 @@ Sınırlar:
 
 Ayarlar > Bluetooth mesh ile açılır, varsayılan kapalıdır. Ortak Wi-Fi veya hotspot olmadan yakın üyeler mesaj eşitler. Android 10 ve üstü gerekir. **Yalnız mesh mesajları geçer; dosyalar hâlâ IP bağlantısı ister.**
 
-- **Keşif:** BLE reklamı. 128 bitlik belirteç ağ anahtarından türer, 10 dakikada bir döner ve üye olmayana rastgele görünür. Reklamda ayrıca düz metin L2CAP kanal numarası ve rastgele 4 baytlık rol etiketi vardır (etiketi büyük olan arar).
+- **Keşif:** BLE reklamı, iOS'un da yayınlayabildiği tek bir 128 bitlik hizmet kimliği: 80 bitlik dönen belirteç (ağ anahtarından türer, 10 dakikada bir değişir, üye olmayana rastgele görünür), L2CAP kanal numarası ve rastgele rol etiketi (etiketi büyük olan arar). Bayt düzeni [docs/PROTOKOL.md](docs/PROTOKOL.md) içinde.
 - **Bağlantı:** Bluetooth eşleştirmesi istemeyen L2CAP kanalı. Bluetooth katmanı bu yüzden güvenlik sağlamaz; üyelik ve gizlilik üstteki Noise oturumundan gelir.
 - **Gecikme:** Yeni mesaj, arayan taraftan hemen, bekleyen taraftan en geç 30 saniyede geçer.
 
 Doğrulananlar (iki emülatör, sanal Bluetooth, aralarında IP yolu yok):
 
 - Birbirini bulma, iki yönde herkese açık ve özel mesaj (1 atlama), art arda yeniden bağlanma.
-- Uygulama yeniden başlayınca bağlantının dönmesi, 10 dakikalık belirteç dönüşünden sonra yeniden bağlanma.
+- Uygulama yeniden başlayınca bağlantının dönmesi, 10 dakikalık belirteç dönüşünden sonra yeniden bağlanma, Bluetooth kapatılıp açılınca kendiliğinden devam etme.
 - Panik silmenin yayını durdurması: karşı cihazda "yakında 0 üye".
 - Birim test: TCP olmayan akışta eşitleme, iki bağlantı üzerinden 2 atlamalı mühürlü mesaj, yanlış ağ kodu, sessiz eşte zaman aşımı.
 

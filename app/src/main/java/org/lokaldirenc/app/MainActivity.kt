@@ -1006,7 +1006,7 @@ private fun BluetoothSection(app: App, node: Node) {
         BleTransport.Status.RUNNING -> "Açık · yakında ${ble.nearby} üye · ${ble.completedSyncs} eşitleme"
         BleTransport.Status.UNSUPPORTED_ANDROID -> "Bu cihazda çalışmaz: Android 10 veya üstü gerekir"
         BleTransport.Status.NO_ADAPTER -> "Bu cihazda Bluetooth yok"
-        BleTransport.Status.ADAPTER_OFF -> "Telefonun Bluetooth'u kapalı. Açıp bu düğmeyi yeniden deneyin"
+        BleTransport.Status.ADAPTER_OFF -> "Telefonun Bluetooth'u kapalı. Açılınca kendiliğinden devam eder"
         BleTransport.Status.NO_PERMISSION -> "Bluetooth izni verilmedi"
         BleTransport.Status.NO_ADVERTISING -> "Bu cihaz Bluetooth reklamını desteklemiyor"
     }

@@ -138,10 +138,22 @@ class LinkTest {
         val keyA = NetCode.discoveryKey(NetCode.generate())
         val keyB = NetCode.discoveryKey(NetCode.generate())
         val token = NetCode.bleToken(keyA, 100)
-        assertEquals(16, token.size)
+        assertEquals(BleAdvert.TOKEN, token.size)
         assertContentEquals(token, NetCode.bleToken(keyA, 100))
         assertFalse(token.contentEquals(NetCode.bleToken(keyA, 101)), "dönem değişince değişmeli")
         assertFalse(token.contentEquals(NetCode.bleToken(keyB, 100)), "ağa bağlı olmalı")
+    }
+
+    @Test
+    fun bleAdvertFitsOneServiceUuid() {
+        val token = NetCode.bleToken(NetCode.discoveryKey(NetCode.generate()), 7)
+        val raw = BleAdvert.encode(token, 0x0081, -2)
+        assertEquals(16, raw.size)
+        val back = BleAdvert.decode(raw)!!
+        assertContentEquals(token, back.token)
+        assertEquals(0x0081, back.psm)
+        assertEquals(0xFFFFFFFEL, back.role)
+        assertEquals(null, BleAdvert.decode(ByteArray(15)))
     }
 
     @Test

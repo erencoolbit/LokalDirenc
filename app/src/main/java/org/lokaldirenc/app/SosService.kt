@@ -32,11 +32,14 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.os.PowerManager
 import org.lokaldirenc.core.SosBeacon
+import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
 import kotlin.math.sin
+
+private fun uuidOf(bytes: ByteArray) = ByteBuffer.wrap(bytes).let { UUID(it.long, it.long) }
 
 /** SOS servisinin arayüzün okuduğu durumu. */
 object SosState {
@@ -80,7 +83,9 @@ class SosService : Service() {
         override fun run() {
             stopAdvertising()
             startAdvertising()
-            handler.postDelayed(this, REFRESH_MS)
+            // Bluetooth kapalıysa veya yeni açılıyorsa yardım çağrısı dakikalarca beklemesin.
+            val adapterOn = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter?.isEnabled == true
+            handler.postDelayed(this, if (adapterOn) REFRESH_MS else RETRY_MS)
         }
     }
 
@@ -156,7 +161,7 @@ class SosService : Service() {
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
-            .addServiceData(ParcelUuid(UUID.fromString(SosBeacon.SERVICE_UUID)), SosBeacon.encode(session, batteryPercent()))
+            .addServiceUuid(ParcelUuid(uuidOf(SosBeacon.encodeUuid(session, batteryPercent()))))
             .build()
         le.startAdvertising(
             AdvertiseSettings.Builder()
@@ -244,6 +249,7 @@ class SosService : Service() {
         private const val CHANNEL = "sos"
         private const val NOTIFICATION = 7
         private const val REFRESH_MS = 5 * 60 * 1000L
+        private const val RETRY_MS = 15_000L
         private const val WHISTLE_EVERY_MS = 30_000L
         private const val SAMPLE_RATE = 44_100
         private const val WHISTLE_HZ = 3150.0
@@ -257,7 +263,6 @@ class SosListener(private val context: Context) {
 
     private val heard = ConcurrentHashMap<Int, Heard>()
     private var scanning = false
-    private val uuid = ParcelUuid(UUID.fromString(SosBeacon.SERVICE_UUID))
 
     private val callback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = handle(result)
@@ -265,7 +270,9 @@ class SosListener(private val context: Context) {
     }
 
     private fun handle(result: ScanResult) {
-        val signal = SosBeacon.decode(result.scanRecord?.getServiceData(uuid)) ?: return
+        val signal = result.scanRecord?.serviceUuids?.firstNotNullOfOrNull { u ->
+            SosBeacon.decodeUuid(ByteBuffer.allocate(16).putLong(u.uuid.mostSignificantBits).putLong(u.uuid.leastSignificantBits).array())
+        } ?: return
         heard[signal.session] = Heard(signal.session, signal.batteryPercent, result.rssi, System.currentTimeMillis(), false)
     }
 

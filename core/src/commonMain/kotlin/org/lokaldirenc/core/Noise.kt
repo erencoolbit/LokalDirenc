@@ -1,15 +1,5 @@
 package org.lokaldirenc.core
 
-import org.bouncycastle.crypto.InvalidCipherTextException
-import org.bouncycastle.crypto.digests.SHA256Digest
-import org.bouncycastle.crypto.macs.HMac
-import org.bouncycastle.crypto.modes.ChaCha20Poly1305
-import org.bouncycastle.crypto.params.AEADParameters
-import org.bouncycastle.crypto.params.KeyParameter
-import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.X25519PublicKeyParameters
-import java.security.SecureRandom
-
 class NoiseException(message: String) : Exception(message)
 
 /**
@@ -31,65 +21,38 @@ internal object Noise {
     class Cipher(private val key: ByteArray) {
         private var nonce = 0L
 
-        private fun aead(encrypt: Boolean, ad: ByteArray): ChaCha20Poly1305 {
+        private fun nonceBytes(): ByteArray {
             val n = ByteArray(12)
             for (i in 0 until 8) n[4 + i] = (nonce ushr (8 * i)).toByte()
-            return ChaCha20Poly1305().apply { init(encrypt, AEADParameters(KeyParameter(key), TAG * 8, n, ad)) }
+            return n
         }
 
-        fun encrypt(plain: ByteArray, ad: ByteArray = ByteArray(0)): ByteArray {
-            val c = aead(true, ad)
-            val out = ByteArray(plain.size + TAG)
-            val len = c.processBytes(plain, 0, plain.size, out, 0)
-            c.doFinal(out, len)
-            nonce++
-            return out
-        }
+        fun encrypt(plain: ByteArray, ad: ByteArray = ByteArray(0)): ByteArray =
+            platformCrypto.aeadEncrypt(key, nonceBytes(), ad, plain).also { nonce++ }
 
         fun decrypt(cipher: ByteArray, ad: ByteArray = ByteArray(0)): ByteArray {
             if (cipher.size < TAG) throw NoiseException("kısa şifreli metin")
-            val c = aead(false, ad)
-            val out = ByteArray(cipher.size - TAG)
-            try {
-                val len = c.processBytes(cipher, 0, cipher.size, out, 0)
-                c.doFinal(out, len)
-            } catch (_: InvalidCipherTextException) {
-                throw NoiseException("kimlik doğrulama başarısız")
-            }
+            val out = platformCrypto.aeadDecrypt(key, nonceBytes(), ad, cipher) ?: throw NoiseException("kimlik doğrulama başarısız")
             nonce++
             return out
         }
     }
 
-    private fun hmac(key: ByteArray, vararg parts: ByteArray): ByteArray {
-        val mac = HMac(SHA256Digest())
-        mac.init(KeyParameter(key))
-        parts.forEach { mac.update(it, 0, it.size) }
-        return ByteArray(32).also { mac.doFinal(it, 0) }
-    }
-
     private fun hkdf(ck: ByteArray, ikm: ByteArray): Triple<ByteArray, ByteArray, ByteArray> {
-        val temp = hmac(ck, ikm)
-        val o1 = hmac(temp, byteArrayOf(1))
-        val o2 = hmac(temp, o1, byteArrayOf(2))
-        val o3 = hmac(temp, o2, byteArrayOf(3))
+        val temp = platformCrypto.hmacSha256(ck, ikm)
+        val o1 = platformCrypto.hmacSha256(temp, byteArrayOf(1))
+        val o2 = platformCrypto.hmacSha256(temp, o1, byteArrayOf(2))
+        val o3 = platformCrypto.hmacSha256(temp, o2, byteArrayOf(3))
         return Triple(o1, o2, o3)
     }
 
-    private fun dh(priv: ByteArray, pub: ByteArray): ByteArray {
-        val out = ByteArray(DH)
-        try {
-            X25519PrivateKeyParameters(priv, 0).generateSecret(X25519PublicKeyParameters(pub, 0), out, 0)
-        } catch (_: IllegalStateException) {
-            throw NoiseException("geçersiz açık anahtar")
-        }
-        return out
-    }
+    private fun dh(priv: ByteArray, pub: ByteArray): ByteArray =
+        platformCrypto.x25519Dh(priv, pub) ?: throw NoiseException("geçersiz açık anahtar")
 
     /** Noise SymmetricState. */
     private class Symmetric(protocol: String) {
         // Şartname: 32 bayta kadar ad özetlenmez, sıfırlarla doldurulur.
-        var ck = protocol.toByteArray().let { if (it.size <= 32) it.copyOf(32) else sha256(it) }
+        var ck = protocol.encodeToByteArray().let { if (it.size <= 32) it.copyOf(32) else sha256(it) }
         var h = ck.copyOf()
         var k: Cipher? = null
 
@@ -125,9 +88,9 @@ internal object Noise {
 
     class Result(val send: Cipher, val recv: Cipher, val handshakeHash: ByteArray, val remoteStatic: ByteArray)
 
-    fun generatePrivate(): ByteArray = X25519PrivateKeyParameters(SecureRandom()).encoded
+    fun generatePrivate(): ByteArray = platformCrypto.x25519GeneratePrivate()
 
-    fun publicOf(priv: ByteArray): ByteArray = X25519PrivateKeyParameters(priv, 0).generatePublicKey().encoded
+    fun publicOf(priv: ByteArray): ByteArray = platformCrypto.x25519PublicOf(priv)
 
     /**
      * XXpsk0:  -> psk, e    <- e, ee, s, es    -> s, se

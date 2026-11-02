@@ -1,11 +1,15 @@
 package org.lokaldirenc.app
 
 import android.app.Application
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.wifi.WifiManager
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.ContextCompat
 import org.lokaldirenc.core.Node
 import java.io.File
 import java.security.SecureRandom
@@ -42,6 +46,18 @@ class App : Application() {
             acquire()
         }
         startNode()
+        // Mesh açıkken Bluetooth sonradan açılırsa kendiliğinden devam etsin.
+        ContextCompat.registerReceiver(
+            this,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                    if (state == BluetoothAdapter.STATE_ON || state == BluetoothAdapter.STATE_OFF) syncBluetooth()
+                }
+            },
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
     }
 
     private fun startNode() {

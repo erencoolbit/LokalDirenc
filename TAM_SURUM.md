@@ -77,7 +77,8 @@ Bugünkü sürüm yalnız Aşama 1 prototipi ile belgenin dışında öne alına
 ## Aşama 6: Çok platform ve güncelleme (4, 14, 15)
 
 - ⬜ Windows, Linux, iOS istemcileri (4)
-- 🟡 Ortak çekirdek: `core/` platformdan bağımsız, ama Module Manager yok (3)
+- 🟡 Ortak çekirdek (3): protokol kodu Kotlin Multiplatform `commonMain` altında ve Windows yerel hedefine derleniyor; biçimler Python vektörleriyle sınanıyor; Bluetooth reklamı iOS'a uygun. **iOS için kalan:** `Node`'un (soket, iş parçacığı, dosya) taşınması, şifreleme uygulaması, iOS Bluetooth ve arayüzü, Mac ve Apple geliştirici hesabı. Hiçbir iOS kodu derlenmedi
+- ⬜ Module Manager (3)
 - ⬜ Çevrimdışı kök anahtar, süreli alt anahtarlar, çok parçalı yedek (14.2)
 - ⬜ İmzalı güncelleme, iptal listesi, asgari sürüm, geri düşürme koruması (14.3, 14.4)
 - 🟡 Yakındaki cihaza uygulama aktarımı: var, parmak izi resmi imzaya dayanmıyor (14.8)

@@ -208,7 +208,10 @@ class LoraTest {
         assertNull(SosBeacon.decode(ByteArray(3)))
         assertNull(SosBeacon.decode(data.copyOf().also { it[0] = 9 }))
         assertNull(SosBeacon.decode(data.copyOf().also { it[5] = 101 }))
-        assertFalse(SosBeacon.SERVICE_UUID.isEmpty())
+        val uuid = SosBeacon.encodeUuid(123456, 87)
+        assertEquals(SosBeacon.UUID_SIZE, uuid.size)
+        assertEquals(SosBeacon.Signal(123456, 87), SosBeacon.decodeUuid(uuid))
+        assertNull(SosBeacon.decodeUuid(ByteArray(16)), "başka hizmet kimliği SOS sayılmamalı")
     }
 
     @Test

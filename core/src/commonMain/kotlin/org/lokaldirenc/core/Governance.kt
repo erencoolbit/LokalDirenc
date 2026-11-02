@@ -1,11 +1,6 @@
 package org.lokaldirenc.core
 
 import kotlinx.serialization.Serializable
-import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 
 /** Yönetilen ağın M-of-N yönetim anahtar seti (Bölüm 11.3). Tek anahtarlı yönetici yoktur. */
 @Serializable
@@ -15,7 +10,7 @@ data class ManagementKeySet(val threshold: Int, val keys: List<String>) {
 
     fun isValid(): Boolean =
         threshold >= MIN_THRESHOLD && keys.size >= threshold && keys.toSet().size == keys.size &&
-            keys.all { it.length == 64 && runCatching { Ed25519PublicKeyParameters(it.unhex(), 0) }.isSuccess }
+            keys.all { it.length == 64 && runCatching { it.unhex() }.isSuccess }
 
     /** QR'da gösterilen parmak izi (Bölüm 10.1). */
     fun fingerprint(): String = sha256(canonical()).hex()
@@ -73,13 +68,9 @@ data class GovernanceEvent(
 
     /** Her yönetici kendi cihazında ayrı imzalar; imzalar sonra birleştirilir. */
     fun signedBy(privateKey: ByteArray): GovernanceEvent {
-        val key = Ed25519PrivateKeyParameters(privateKey, 0)
-        val signer = Ed25519Signer()
-        signer.init(true, key)
-        val message = signedBytes()
-        signer.update(message, 0, message.size)
-        val public = key.generatePublicKey().encoded.hex()
-        return copy(signatures = signatures.filter { it.key != public } + GovernanceSignature(public, signer.generateSignature().hex()))
+        val public = platformCrypto.ed25519PublicOf(privateKey).hex()
+        val signature = platformCrypto.ed25519Sign(privateKey, signedBytes()).hex()
+        return copy(signatures = signatures.filter { it.key != public } + GovernanceSignature(public, signature))
     }
 
     /** Sette olan, farklı ve geçerli imza sayısı. Aynı anahtarın iki imzası tek sayılır. */
@@ -91,13 +82,8 @@ data class GovernanceEvent(
     }
 
     private fun verify(key: String, sig: String, message: ByteArray): Boolean = try {
-        val signer = Ed25519Signer()
-        signer.init(false, Ed25519PublicKeyParameters(key.unhex(), 0))
-        signer.update(message, 0, message.size)
-        signer.verifySignature(sig.unhex())
+        platformCrypto.ed25519Verify(key.unhex(), sig.unhex(), message)
     } catch (_: IllegalArgumentException) {
-        false
-    } catch (_: IndexOutOfBoundsException) {
         false
     }
 }
@@ -251,7 +237,7 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
         private val JSON = kotlinx.serialization.json.Json { ignoreUnknownKeys = false }
 
         /** Network ID = Hash("LD-NET-v1" + ilk yönetim anahtar seti) (Bölüm 6.1). */
-        fun networkIdOf(keys: ManagementKeySet): String = sha256("LD-NET-v1".toByteArray() + keys.canonical()).hex()
+        fun networkIdOf(keys: ManagementKeySet): String = sha256("LD-NET-v1".encodeToByteArray() + keys.canonical()).hex()
 
         fun encode(value: GenesisPayload) = JSON.encodeToString(GenesisPayload.serializer(), value)
         fun encode(value: NetworkDefinition) = JSON.encodeToString(NetworkDefinition.serializer(), value)
@@ -270,24 +256,11 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
          * Olay zincirini baştan doğrular. [expectedNetworkId] güvenilir kaynaktan, QR'dan gelir;
          * zinciri veren düğüme güvenilmez (Bölüm 10.1).
          */
-        fun bootstrap(expectedNetworkId: String, events: List<GovernanceEvent>, now: () -> Long = System::currentTimeMillis): GovernanceLog {
+        fun bootstrap(expectedNetworkId: String, events: List<GovernanceEvent>, now: () -> Long = ::currentTimeMillis): GovernanceLog {
             val log = GovernanceLog(expectedNetworkId, now)
             events.forEach(log::apply)
             if (log.keys == null) throw GovernanceRejected(GovernanceReject.BAD_SEQUENCE)
             return log
         }
-    }
-}
-
-/** Uzunluk önekli alanlar: alan sınırı kaydırılarak aynı imza başka anlama getirilemez. */
-internal object Canon {
-    fun fields(vararg values: String): ByteArray {
-        val out = ByteArrayOutputStream()
-        for (v in values) {
-            val b = v.toByteArray()
-            out.write(ByteBuffer.allocate(4).putInt(b.size).array())
-            out.write(b)
-        }
-        return out.toByteArray()
     }
 }

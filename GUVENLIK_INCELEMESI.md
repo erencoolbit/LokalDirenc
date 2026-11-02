@@ -31,7 +31,7 @@ Düzeltilmedi. Çoğu tasarım kararı gerektiriyor. Önem sırası yazarın de�
 
 ### Orta
 
-6. **Trafikten tanınma.** Keşif paketleri şifreli ama sabit porttan (47474), sabit boyda (266 bayt) ve 3 saniyede bir gider. Ağı izleyen biri içeriği okuyamasa da uygulamanın çalıştığını anlayabilir. "Şifreli iletişim yazılımı kullanmanın" hukuki riski (Bölüm 18) düşünülünce önemli. BLE reklamının biçimi de benzer şekilde sabit.
+6. **Trafikten tanınma.** Keşif paketleri şifreli ama sabit porttan (47474), sabit boyda (268 bayt) ve 3 saniyede bir gider. Ağı izleyen biri içeriği okuyamasa da uygulamanın çalıştığını anlayabilir. "Şifreli iletişim yazılımı kullanmanın" hukuki riski (Bölüm 18) düşünülünce önemli. BLE reklamının biçimi de benzer şekilde sabit.
 7. **Mühürlü zarf seli.** Yazarı görünmediği için üye, 300 zarflık toplam kotayı doldurup başkalarının özel mesajlarını düşürebilir.
 8. **İstasyon kimlik doğrulamaz.** Bluetooth ile bağlanan herkes çerçeve yazıp istasyonun yayın süresi hakkını tüketebilir; Wi-Fi ağı da açık. Anahtarsız tasarımın bedeli. Radyo karıştırma ise zaten engellenemez.
 9. **Radyo görünürlüğü.** LoRa ve sabit istasyonun yönü bulunabilir, cihaz el konulabilir.
