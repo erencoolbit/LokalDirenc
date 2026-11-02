@@ -1,6 +1,6 @@
 # Eklenecekler
 
-Fikirlerin durumu ve kalan işler. Ayrıntılar [README.md](README.md) içinde.
+Fikirlerin durumu ve kalan işler. Ayrıntılar [TEKNIK.md](TEKNIK.md) içinde.
 
 ## Tamamlandı: Mesaj gönderirken gönderim yöntemleri
 

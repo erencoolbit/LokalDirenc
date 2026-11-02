@@ -24,7 +24,7 @@ sealed class Msg {
 
     /** Mesh eşitlemesi: iletilebilir zarf kimlikleri ve gönderenin kendi duyurusu. */
     @Serializable @SerialName("mesh_inv")
-    data class MeshInv(val ids: List<String>, val self: MeshWire? = null) : Msg()
+    data class MeshInv(val ids: List<String>, val self: MeshWire? = null, val digest: String = "") : Msg()
 
     @Serializable @SerialName("mesh_push")
     data class MeshPush(val items: List<MeshWire>) : Msg()
@@ -75,8 +75,8 @@ class SecureChannel internal constructor(
     private val link: Link,
     private val session: Noise.Result,
 ) : AutoCloseable {
-    private val input = DataInputStream(link.input.buffered())
-    private val output = DataOutputStream(link.output.buffered())
+    private val input = DataInputStream(link.input.buffered(IO_BUFFER))
+    private val output = DataOutputStream(link.output.buffered(IO_BUFFER))
 
     /** Karşı tarafın ağ içi takma kimliği: statik anahtarın özeti. */
     val remoteFingerprint: String = sha256(session.remoteStatic).hex()
@@ -167,7 +167,10 @@ class SecureChannel internal constructor(
         private const val KIND_CONTROL: Byte = 1
         private const val KIND_CHUNK: Byte = 2
         private const val MAX_PLAIN_FRAGMENT = 65535 - 16 - 1
-        private const val MAX_MESSAGE = 16 * 1024 * 1024
+        // Telefonda sekiz oturumun belleği tüketmemesi için. En büyük meşru mesaj: 1 MB parça
+        // veya 2 GB dosyanın 256 KB parçalarla özet listesi.
+        private const val MAX_MESSAGE = 4 * 1024 * 1024
+        private const val IO_BUFFER = 64 * 1024
         internal val JSON = Json { classDiscriminator = "t"; ignoreUnknownKeys = true }
 
         /** Kodu bilmeyen veya sürümü uyuşmayan düğümde [NoiseException] atar. */

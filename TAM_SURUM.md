@@ -1,6 +1,6 @@
 # Tam sürüm gereklilikleri
 
-Kaynak: *Lokal Direnç Sistem ve Mimari v1.5*. Parantez içindeki numaralar belgenin bölümleridir. Bu liste belgeden çıkarılan iş listesidir, belgenin yerini tutmaz.
+Kaynak: *Lokal Direnç Sistem ve Mimari* belgesi. Parantez içindeki numaralar belgenin bölümleridir. Bu liste belgeden çıkarılan iş listesidir, belgenin yerini tutmaz.
 
 **Durum:** ✅ var · 🟡 kısmen veya prototip düzeyinde · ⬜ yok
 
@@ -95,7 +95,7 @@ Bugünkü sürüm yalnız Aşama 1 prototipi ile belgenin dışında öne alına
 - ⬜ Hukuk incelemesi: lisanslar, gizlilik, KVKK/GDPR, mağaza kuralları, yönetici ve arşiv sorumlulukları, kural 12 (18)
 - ⬜ Lisans dosyası, öneri AGPL-3.0 ve protokol için ayrı serbest lisans (20)
 - ⬜ Kademeli beta
-- ⬜ Dağıtım güveni: resmi imza, yeniden üretilebilir derleme, mağaza. Galaxy'de virüs uyarısı bu başlığa girer; bkz. README "Kurulum uyarıları"
+- ⬜ Dağıtım güveni: resmi imza, yeniden üretilebilir derleme, mağaza. Galaxy'de virüs uyarısı bu başlığa girer; bkz. TEKNIK.md "Kurulum uyarıları"
 
 ## Karar bekleyen konular (20)
 
@@ -115,7 +115,7 @@ Ayrıca varsayılan değerler onay bekliyor: 2-of-3, yetki süreleri, quorum, be
 
 Belgede olmayan veya ondan ayrılan kararlar. Belgenin yeni sürümüne yazılmalı:
 
-- Şifreli oturumun doğrulamadan önce kurulması, psk0 ve diğer sapmalar (README).
+- Şifreli oturumun doğrulamadan önce kurulması, psk0 ve diğer sapmalar (TEKNIK.md).
 - Mesh mesajlaşma ve Bluetooth'un öne alınması; ara cihazların gördüğü metadata.
 - LoRa köprüsü ve anahtarsız topluluk istasyonu.
 - Afet SOS modu ve sabit kimlik istisnası.

@@ -131,7 +131,10 @@ class ShareServer(
     private fun readRequestLine(input: InputStream): String? {
         val all = StringBuilder()
         var total = 0
+        // Bayt bayt gönderen istemci yuvayı süresiz tutamasın.
+        val deadline = System.currentTimeMillis() + READ_TIMEOUT_MS
         while (total < MAX_HEADER) {
+            if (System.currentTimeMillis() > deadline) return null
             val b = input.read()
             if (b < 0) return null
             all.append(b.toChar())

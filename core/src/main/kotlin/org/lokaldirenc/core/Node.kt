@@ -50,7 +50,8 @@ data class NodeConfig(
     val meshIntervalMs: Long = 3000,
     /** Yeni zarf olmasa da eşlerle yeniden karşılaştırma aralığı. */
     val meshResyncMs: Long = 30_000,
-    val meshFlushMs: Long = 2000,
+    /** Tüm durum her yazımda yeniden şifrelenir; sık yazmak pil harcar. Kapanışta da yazılır. */
+    val meshFlushMs: Long = 10_000,
 )
 
 enum class TransferStatus { PREPARING, CONNECTING, PAIRING, AWAIT_ACCEPT, WAITING_PEER, TRANSFERRING, VERIFYING, DONE, REJECTED, FAILED }
@@ -128,6 +129,12 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     private val mesh = MeshEngine({ it in state.blockedPeers })
     private val meshSyncing = ConcurrentHashMap.newKeySet<String>()
     private val meshLastSync = ConcurrentHashMap<String, Pair<Long, Long>>()
+    private val handshakes = HashMap<String, Int>()
+    private val deadlines = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "ld-deadline").apply { isDaemon = true } }
+
+    /** Eş başına görülen adresler. Yalnız el sıkışmayla doğrulanan adres listede kalıcı olur. */
+    private val addressSeen = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
+    private val verifiedAddress = ConcurrentHashMap<String, String>()
 
     @Volatile
     var onChange: () -> Unit = {}
@@ -157,17 +164,12 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
                     } catch (_: IOException) {
                         break
                     }
-                    if (!sessionSlots.tryAcquire()) {
+                    val source = socket.inetAddress?.hostAddress ?: "?"
+                    if (!enterHandshake(source)) {
                         runCatching { socket.close() }
                         continue
                     }
-                    pool.execute {
-                        try {
-                            runReceiver(this, SocketLink(socket))
-                        } finally {
-                            sessionSlots.release()
-                        }
-                    }
+                    pool.execute { serveIncoming(this, SocketLink(socket), source) }
                 }
             }
         }
@@ -215,6 +217,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         runtimes.clear()
         discoverySocket?.close()
         pool.shutdownNow()
+        deadlines.shutdownNow()
     }
 
     private fun startRuntime(n: StoredNetwork): NetRuntime {
@@ -396,16 +399,12 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     /** Gelen bağlantıyı karşılar ve bitene kadar bekler. Bağlantıyı kapatır. */
     fun acceptLink(networkId: String, link: Link) {
         val rt = runtimes[networkId]
-        if (rt == null || !sessionSlots.tryAcquire()) {
+        if (rt == null || !enterHandshake("bluetooth")) {
             link.close()
             return
         }
-        try {
-            runReceiver(rt, link)
-        } finally {
-            sessionSlots.release()
-            link.close()
-        }
+        serveIncoming(rt, link, "bluetooth")
+        link.close()
     }
 
     /** Bağlantı üzerinden mesh eşitlemesi yapar. Başarısızsa istisna atar; bağlantıyı kapatır. */
@@ -441,34 +440,54 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
             val version = mesh.version(rt.id)
             for (peer in peers(rt.id)) {
                 val fp = peer.fingerprint ?: continue
-                val key = "${rt.id}|$fp"
-                val last = meshLastSync[key]
-                if (last != null && last.first == version && time - last.second < config.meshResyncMs) continue
-                if (!meshSyncing.add(key)) continue
-                if (!sessionSlots.tryAcquire()) {
-                    meshSyncing.remove(key)
-                    continue
-                }
-                meshLastSync[key] = version to time
-                pool.execute {
-                    try {
-                        val socket = Socket()
-                        socket.soTimeout = config.handshakeTimeoutMs
-                        socket.connect(InetSocketAddress(peer.host, peer.port), config.handshakeTimeoutMs)
-                        SecureChannel.handshake(socket, true, rt.staticPriv, rt.psk, rt.idBytes).use { ch ->
-                            if (ch.remoteFingerprint == fp && fp !in state.blockedPeers) {
-                                exchangeHello(ch, PURPOSE_MESH)
-                                meshExchange(ch, rt, true)
-                            }
-                        }
-                    } catch (_: Exception) {
-                        // Eş gitmiş olabilir; bir sonraki karşılaşmada yeniden denenir.
-                    } finally {
-                        sessionSlots.release()
+                val peerKey = "${rt.id}|$fp"
+                val seen = addressSeen[peerKey] ?: continue
+                seen.values.removeIf { time - it > config.peerTtlMs }
+                // Doğrulanmamış adresler de denenir: eş taşındıysa böyle bulunur, sahteyse el sıkışma düşer.
+                for (address in seen.keys.take(MAX_ADDRESSES_TRIED)) {
+                    val key = "$peerKey|$address"
+                    val last = meshLastSync[key]
+                    val unchanged = last != null && last.first == version && time - last.second < config.meshResyncMs
+                    if (unchanged) continue
+                    if (!meshSyncing.add(key)) continue
+                    if (!sessionSlots.tryAcquire()) {
                         meshSyncing.remove(key)
+                        continue
+                    }
+                    meshLastSync[key] = version to time
+                    pool.execute {
+                        try {
+                            meshSyncTo(rt, peerKey, fp, address)
+                        } catch (_: Exception) {
+                            // Eş gitmiş olabilir veya adres sahte; bir sonraki turda yeniden denenir.
+                        } finally {
+                            sessionSlots.release()
+                            meshSyncing.remove(key)
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private fun meshSyncTo(rt: NetRuntime, peerKey: String, fp: String, address: String) {
+        val host = address.substringBeforeLast(':')
+        val port = address.substringAfterLast(':').toInt()
+        val socket = Socket()
+        socket.soTimeout = config.handshakeTimeoutMs
+        socket.connect(InetSocketAddress(host, port), config.handshakeTimeoutMs)
+        SecureChannel.handshake(socket, true, rt.staticPriv, rt.psk, rt.idBytes).use { ch ->
+            if (ch.remoteFingerprint != fp || fp in state.blockedPeers) return
+            // Canlı doğrulanmış adres korunur: eş iki adresten ulaşılabilirse liste oynamasın.
+            val current = verifiedAddress[peerKey]
+            val currentAlive = current != null && current != address &&
+                System.currentTimeMillis() - (addressSeen[peerKey]?.get(current) ?: 0) <= config.peerTtlMs
+            if (!currentAlive) {
+                verifiedAddress[peerKey] = address
+                peers.computeIfPresent(peerKey) { _, p -> p.copy(host = host, port = port) }
+            }
+            exchangeHello(ch, PURPOSE_MESH)
+            meshExchange(ch, rt, true)
         }
     }
 
@@ -476,10 +495,19 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     private fun meshExchange(ch: SecureChannel, rt: NetRuntime, initiator: Boolean) {
         ch.setTimeout(config.ioTimeoutMs)
         val mine = mesh.inventory(rt.id)
-        ch.send(Msg.MeshInv(mine, mesh.selfPresence(rt.id)))
+        // Önce yalnız özet: boşta geçen eşitleme tüm kimlik listesini taşımasın.
+        val digest = sha256(mine.sorted().joinToString("").toByteArray()).hex()
+        ch.send(Msg.MeshInv(emptyList(), mesh.selfPresence(rt.id), digest))
+        val first = ch.receiveControl() as? Msg.MeshInv ?: throw ProtocolException("Envanter bekleniyordu")
+        mesh.acceptLinkPresence(rt.id, first.self, ch.remoteFingerprint)
+        if (first.digest == digest) {
+            if (initiator) ch.send(Msg.MeshEnd) else runCatching { ch.receiveControl() }
+            notifyChange()
+            return
+        }
+        ch.send(Msg.MeshInv(mine))
         val theirs = ch.receiveControl() as? Msg.MeshInv ?: throw ProtocolException("Envanter bekleniyordu")
         if (theirs.ids.size > MESH_MAX_INVENTORY) throw ProtocolException("Envanter çok büyük")
-        mesh.acceptLinkPresence(rt.id, theirs.self, ch.remoteFingerprint)
         val wanted = (mine.toSet() - theirs.ids.toSet()).take(MESH_MAX_PUSH)
         fun push() {
             mesh.outgoing(rt.id, wanted).chunked(MESH_PUSH_BATCH).forEach { ch.send(Msg.MeshPush(it)) }
@@ -621,8 +649,18 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
             for (rt in runtimes.values) {
                 val p = Beacon.open(rt.discKey, packet.data, packet.length) ?: continue
                 if (p.fp == rt.fingerprint) break
-                val before = peers["${rt.id}|${p.fp}"]
-                peers["${rt.id}|${p.fp}"] = Peer(rt.id, packet.address.hostAddress ?: "", p.port, p.fp, sanitizeNick(p.nick), false, System.currentTimeMillis())
+                val key = "${rt.id}|${p.fp}"
+                val host = packet.address.hostAddress ?: ""
+                val address = "$host:${p.port}"
+                val time = System.currentTimeMillis()
+                val seen = addressSeen.getOrPut(key) { ConcurrentHashMap() }
+                seen[address] = time
+                // Keşif paketi kayıttan oynatılabilir. Doğrulanmış adres canlıyken başka adres
+                // onun yerine geçmez; yeni adres ancak el sıkışmayı geçerse kabul edilir.
+                val verified = verifiedAddress[key]
+                if (verified != null && verified != address && time - (seen[verified] ?: 0) <= config.peerTtlMs) break
+                val before = peers[key]
+                peers[key] = Peer(rt.id, host, p.port, p.fp, sanitizeNick(p.nick), false, time)
                 if (before == null) notifyChange()
                 break
             }
@@ -769,17 +807,61 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
 
     // ---- Alıcı ----
 
-    private fun runReceiver(rt: NetRuntime, link: Link) {
+    /**
+     * Kimliği doğrulanmamış bağlantılar oturum hakkı tüketemez: ağ kodunu bilmeyen biri boş
+     * bağlantılarla hizmeti durdurmasın. Kaynak başına ve toplam sınır vardır.
+     */
+    private fun enterHandshake(source: String): Boolean = synchronized(handshakes) {
+        val count = handshakes[source] ?: 0
+        if (count >= MAX_HANDSHAKES_PER_SOURCE || handshakes.values.sum() >= MAX_HANDSHAKES) return false
+        handshakes[source] = count + 1
+        true
+    }
+
+    private fun leaveHandshake(source: String) = synchronized(handshakes) {
+        val count = (handshakes[source] ?: 1) - 1
+        if (count <= 0) handshakes.remove(source) else handshakes[source] = count
+    }
+
+    private fun serveIncoming(rt: NetRuntime, link: Link, source: String) {
+        val ch = try {
+            authenticate(rt, link)
+        } finally {
+            leaveHandshake(source)
+        } ?: return
+        if (!sessionSlots.tryAcquire()) {
+            ch.close()
+            return
+        }
+        try {
+            runReceiver(rt, ch)
+        } finally {
+            sessionSlots.release()
+            ch.close()
+        }
+    }
+
+    /**
+     * Kesin süre sınırı: okuma zaman aşımı her baytta yenilendiği için tek başına yetmez,
+     * yoksa bayt bayt gönderen biri bağlantıyı dakikalarca tutabilir.
+     * Kodu bilmeyen düğüme hiçbir bilgi verilmez ve kayıt tutulmaz.
+     */
+    private fun authenticate(rt: NetRuntime, link: Link): SecureChannel? {
+        link.setTimeout(config.handshakeTimeoutMs)
+        val alarm = deadlines.schedule({ link.close() }, config.handshakeTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        return try {
+            SecureChannel.handshake(link, false, rt.staticPriv, rt.psk, rt.idBytes)
+        } catch (_: Exception) {
+            link.close()
+            null
+        } finally {
+            alarm.cancel(false)
+        }
+    }
+
+    private fun runReceiver(rt: NetRuntime, ch: SecureChannel) {
         var id: String? = null
         try {
-            link.setTimeout(config.handshakeTimeoutMs)
-            val ch = try {
-                SecureChannel.handshake(link, false, rt.staticPriv, rt.psk, rt.idBytes)
-            } catch (_: Exception) {
-                // Kodu bilmeyen düğüme hiçbir bilgi verilmez ve kayıt tutulmaz.
-                link.close()
-                return
-            }
             ch.use {
                 // Engellenen kişi fark edilmeden kapatılır.
                 if (ch.remoteFingerprint in state.blockedPeers) return
@@ -809,7 +891,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     private fun validate(o: Msg.Offer) {
         val hexRe = Regex("^[0-9a-f]{64}$")
         if (!hexRe.matches(o.fileHash) || !hexRe.matches(o.root)) throw ProtocolException("Geçersiz özet")
-        if (o.chunkSize !in 16 * 1024..4 * 1024 * 1024) throw ProtocolException("Geçersiz parça boyutu")
+        if (o.chunkSize !in 16 * 1024..1024 * 1024) throw ProtocolException("Geçersiz parça boyutu")
         if (o.size < 0) throw ProtocolException("Geçersiz boyut")
         if (Manifest.chunkCount(o.size, o.chunkSize) != o.chunkHashes.size.toLong()) throw ProtocolException("Parça sayısı tutmuyor")
         if (!o.chunkHashes.all { hexRe.matches(it) }) throw ProtocolException("Geçersiz parça özeti")
@@ -831,6 +913,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         partial.mkdirs()
         if (partial.usableSpace < offer.size + 16 * 1024 * 1024) return reject("no_space", "Depolama alanı yetersiz")
 
+        // Bir üye sürekli teklif açıp ekranı istemlerle dolduramasın.
+        if (acceptPrompts.size >= MAX_PROMPTS) return reject("busy", "Çok fazla bekleyen istek")
         val warnings = ArrayList<String>()
         if (FileSafety.isRiskyName(name)) warnings += "Riskli dosya uzantısı: .${FileSafety.extension(name)}"
         update(id) { it.copy(status = TransferStatus.AWAIT_ACCEPT, needsAccept = true, warnings = warnings) }
@@ -948,6 +1032,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         val fp = ch.remoteFingerprint
         val known = state.trusted.any { it.networkId == rt.id && it.fingerprint == fp }
         if (!known) {
+            if (pairPrompts.size >= MAX_PROMPTS) throw ProtocolException("Çok fazla bekleyen istek")
             update(id) { it.copy(status = TransferStatus.PAIRING, needsPairing = true) }
             val prompt = CompletableFuture<Boolean>()
             pairPrompts[id] = prompt
@@ -992,7 +1077,12 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
 
     private fun persistHistory(id: String) {
         val t = transfers[id] ?: return
-        mutate { s -> s.copy(history = s.history.filter { it.id != id } + t) }
+        // Her başarısız deneme bir kayıt: sınırsız büyürse şifreli durum dosyası şişer.
+        mutate { s -> s.copy(history = (s.history.filter { it.id != id } + t).takeLast(MAX_HISTORY)) }
+        val finished = transfers.values.filter { it.status.isFinal }
+        if (finished.size > MAX_HISTORY) {
+            finished.sortedBy { it.createdAt }.take(finished.size - MAX_HISTORY).forEach { transfers.remove(it.id) }
+        }
         notifyChange()
     }
 
@@ -1035,6 +1125,11 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         private const val PRESENCE_REFRESH_MS = 24L * 3_600_000
         private const val LORA_WINDOW_MS = 10L * 60_000
         const val LORA_MAX_FRAMES = 20
+        const val MAX_HANDSHAKES = 16
+        const val MAX_HANDSHAKES_PER_SOURCE = 4
+        const val MAX_PROMPTS = 4
+        const val MAX_HISTORY = 200
+        private const val MAX_ADDRESSES_TRIED = 4
         private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     }
 }

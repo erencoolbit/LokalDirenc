@@ -226,6 +226,11 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         if (id != net.identity.id && (existing == null || existing.issuedAt < w.issuedAt)) {
             // Yeni bir kutu anahtarı duyurulursa sahiplik kanıtı yeniden gerekir.
             val proven = existing?.proven == true && existing.box == p.box
+            if (existing == null && net.contacts.size >= MAX_CONTACTS) {
+                // Sahte kimlik seliyle liste şişmesin: önce kanıtsız en eskisi gider, kanıtlılar korunur.
+                val oldest = net.contacts.values.filter { !it.proven }.minByOrNull { it.issuedAt } ?: return true
+                net.contacts.remove(oldest.id)
+            }
             net.contacts[id] = MeshContact(id, p.box, cleanNick(p.nick), w.issuedAt, proven)
         }
         return true
@@ -424,6 +429,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         const val MAX_STORED = 500
         const val MAX_PER_AUTHOR = 100
         const val MAX_DIRECT_STORED = 300
+        const val MAX_CONTACTS = 1000
         private const val MAX_SEEN = 3000
         private const val MAX_MESSAGES = 500
         private const val PAD_UNIT = 512

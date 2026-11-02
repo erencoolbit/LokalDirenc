@@ -233,10 +233,25 @@ class BleTransport(private val context: Context, private val onChange: () -> Uni
         }
     }
 
+    /** Tarama saniyede çok sonuç verebilir: belirteçler dönem başına bir kez hesaplanır. */
     private fun networkFor(n: Node, uuid: UUID): String? {
         val epoch = epochNow()
-        return n.networks().firstOrNull { net -> n.bleTokens(net.id, epoch, EPOCH_TOLERANCE).any { uuidOf(it) == uuid } }?.id
+        val ids = n.networks().map { it.id }
+        val cached = tokenCache
+        val table = if (cached != null && cached.epoch == epoch && cached.networks == ids) {
+            cached.tokens
+        } else {
+            ids.flatMap { id -> n.bleTokens(id, epoch, EPOCH_TOLERANCE).map { uuidOf(it) to id } }.toMap().also {
+                tokenCache = TokenCache(epoch, ids, it)
+            }
+        }
+        return table[uuid]
     }
+
+    private class TokenCache(val epoch: Long, val networks: List<String>, val tokens: Map<UUID, String>)
+
+    @Volatile
+    private var tokenCache: TokenCache? = null
 
     private fun maybeDial(n: Node, network: String, result: ScanResult, psm: Int) {
         val device = result.device
