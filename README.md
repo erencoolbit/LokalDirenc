@@ -26,6 +26,8 @@ Her koşulda iletişimi garanti etmek, mutlak anonimlik vaat etmek veya hukuka a
 
 **Bu bir prototiptir.** Bağımsız güvenlik incelemesinden geçmedi ve gerçek riskli durumlarda kullanılmamalıdır. Şifreli iletişim yazılımlarının kullanımı bazı ülkelerde hukuki sonuçlar doğurabilir; kendi durumunuzu değerlendirin.
 
+Geliştirmede yapay zeka araçlarından yardım alındı.
+
 Ayrıntılar: [Teknik notlar](TEKNIK.md) · [Güvenlik incelemesi](GUVENLIK_INCELEMESI.md) · [Yol haritası](TAM_SURUM.md)
 
 ---
@@ -53,5 +55,7 @@ Guaranteeing communication under all conditions, promising absolute anonymity, o
 ### Status
 
 **This is a prototype.** It has not undergone an independent security review and must not be relied on in genuinely risky situations. Using encrypted communication software can have legal consequences in some countries; assess your own situation.
+
+AI tools were used to assist development.
 
 Detailed documentation is currently in Turkish: [Technical notes](TEKNIK.md) · [Security review](GUVENLIK_INCELEMESI.md) · [Roadmap](TAM_SURUM.md)
