@@ -70,6 +70,23 @@ Sıkı zarf: `[tür 1: 0 presence, 1 public, 2 direct][zaman 8][atlama 1][yazar 
 
 İmzalanan: `Canon("LD-GOV-v1", ağ, tür, sıra, önceki özet, zaman, içerik)`. Olay özeti bunun SHA-256'sıdır. Kurallar: [Governance.kt](../core/src/commonMain/kotlin/org/lokaldirenc/core/Governance.kt).
 
+## Yönetilen ağda oturum ve üyelik
+
+Network ID kamuya açıktır ve yönetici kanıtı değildir. Bağlantı anahtarları rastgele 32 baytlık **ağ sırrından** türer: `HKDF(ağ sırrı, "LD-MANAGED-v1|psk")`, aynı şekilde `disc` ve `lora`. Sırrı bilmeyen el sıkışamaz, keşif paketlerini ve LoRa çerçevelerini açamaz.
+
+Sır, `ld://managed?d=` bağlantısıyla gider (Base64Url JSON: kimlik, sır, ad, mod ipucu, varsa bilet ve davet sırrı). Açık ve karma ağda QR ile paylaşılır, davetli ağda yalnız davetin içinde gider. Kurulum paketi: `ld://sign?d=`.
+
+Eşitlemede önce `gov_have` / `gov_events` ile zincir değişilir, sonra başlatan `mesh_end` ile onaylar (Bluetooth'ta erken kapanış son paketi düşürür). Ardından giriş modu uygulanır: açık herkese tam, karma onaysıza salt okunur, davetli onaysıza kapalı. Sonra `gov_proposals` ile onay bekleyen kararlar değişilir; geçersiz imzalar atılır.
+
+Yönetici kanıtı: yönetici anahtarıyla `Canon("LD-ADMIN-MEMBER-v1", ağ, parmak izi)`.
+
+**Ağ sırrı yenileme:** `secret_rotate` olayı `{epoch, sealed[]}` taşır. Her mühür `Noise_X` ile bir üyeye yazılır, prologue `"LD-SECRET-1|ağ|dönem"`, içerik yeni sır. Üye hepsini dener. Eski sır 72 saat daha kabul edilir: yanıtlayan iki anahtarı da dener, keşif iki anahtarla yapılır, LoRa iki anahtarla açılır ama yalnız yeniyle yazılır. Bluetooth'ta reklam yeni anahtarladır; eski belirteci gören cihaz, rol etiketine bakmadan eski anahtarla arar ki yeni sır karşıya ulaşsın.
+
+**Tanıklık:** Yönetilen ağda bir üye ilk görüldüğünde `witness` zarfı imzalanır: `{subject}`, zaman zarfın kendisinden. Tanık başına ilk gözlem geçerlidir. Süre, en az K (3) tanığın medyanıdır.
+
+- Davet bileti: yöneticiler eşik kadar `Canon("LD-INVITE-v1", ağ, davet no, davet anahtarı, bitiş, en çok kullanım)` imzalar.
+- Üyelik kanıtı: sır olan davet anahtarıyla `Canon("LD-MEMBER-v1", ağ, davet no, parmak izi, zaman)` imzalanır.
+
 ## Ortak kod ve platforma özgü kod
 
 | Yer | İçerik |

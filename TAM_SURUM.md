@@ -23,20 +23,25 @@ Bugünkü sürüm yalnız Aşama 1 prototipi ile belgenin dışında öne alına
 
 ## Aşama 2: Yönetilen ağ (5, 6, 11)
 
-**İlk dilim çekirdekte (`Governance.kt`) yazıldı ve test edildi; henüz ağa ve arayüze bağlı değil, kullanıcı göremez.** Aşağıda 🟡 olanlar bu nedenle kısmen sayılır.
+**Uygulamada kullanılabilir durumda.** İki emülatörde kurma, ortak imza, davet oluşturma, sonlandırma ve ağ sırrı yenileme denendi. Gerçek telefonda denenmedi, güvenlik incelemesinden geçmedi.
 
-- 🟡 M-of-N çoklu imzalı yönetim anahtarı, en az 2 imza (11.3)
-- 🟡 Network ID'nin yönetim anahtar setinden türemesi, imzalı rotasyon zinciri (6.1)
-- 🟡 İmzalı ağ tanımı (6.1). QR ve katılım akışı yok (10.1)
-- ⬜ Giriş modları: açık, karma, davetli; katılmadan önce görünür (5.5)
-- ⬜ Davet kodu: 24 saat, 1 kullanım (6.2); üyelik sertifikası ve iptali (5.5)
-- 🟡 Süreli yönetici yetkisi, en çok 1 yıl; süresi dolunca askı (5.1, 11.1). Askıdayken yenileme ve anahtar değişimi açık bırakıldı: belgeye işlenecek karar
-- 🟡 Eylem izin listesi: yönetici eylemleri için var (11.4). Moderatör ve üye rolleri Aşama 3'te
-- 🟡 Eşik sağlanırsa anahtar değiştirme (11.3). Eşik kaybında yönetimsiz kipe düşme yok
-- 🟡 Ağ kimliğini emekli etme: 72 saat bekleme, iptal, acil sonlandırma (11.6). "Sil / dışa aktar / sakla" sorusu yok
-- ⬜ Olay zincirinin üyeler arasında dağıtılması ve Node'a bağlanması
-- ⬜ Yönetilen ağ kurma ve yönetme arayüzü
-- ⬜ Tanıklık kayıtları, medyan zaman, nedensel sıra (13.4)
+- ✅ M-of-N çoklu imzalı yönetim, en az 2 imza (11.3). İki telefonda ortak imza akışı var
+- ✅ Network ID'nin yönetim anahtar setinden türemesi, sahte zincirin reddi (6.1, 10.1)
+- ✅ İmzalı ağ tanımı (6.1)
+- ✅ Giriş modları: açık, karma, davetli (5.5)
+- ✅ Davet ve üyelik kanıtı, iptal (6.2, 5.5). Çevrimiçi yönetici gerektirmez
+- ✅ Süreli yönetici yetkisi, askı, yenileme (5.1, 11.1). Askıdayken yenileme ve anahtar değişimi açık: belgeye işlenecek karar
+- ✅ Eylem izin listesi: yönetici eylemleri (11.4). Moderatör ve üye rolleri Aşama 3'te
+- ✅ Ağı emekli etme: 72 saat, iptal, acil; "sil / sakla" sorusu (11.6)
+- ✅ Zincirin üyelere yayılması, çatallanma uyarısı, öneri ve onay akışı
+- ✅ Kurma, katılma, davet ve yönetim ekranları
+- 🟡 Yönetici anahtar saklama: Keystore anahtarıyla şifreli durum dosyasında. Anahtar donanımda imza atmıyor
+- ✅ Yönetici değişimi (11.3): ekranı var, eski setin eşiğiyle onaylanır, Network ID değişmez. Ekrandan denenmedi, birim testte geçti
+- ✅ Üyelik iptali ve ağ sırrı yenileme: yeni sır üyelere ayrı ayrı mühürlenir, iptal edilen alamaz ve yeni LoRa çerçevelerini okuyamaz. Eski kayıtlı çerçeveler açık kalır
+- 🟡 Tek kullanımlık davet: her cihaz ilk göreni kabul eder, ağ genelinde kesin değildir. Süre cihaz saatine dayanır
+- 🟡 "Dışa aktar" (11.6): tek tek dosya kaydetme var, toplu dışa aktarma yok
+- ⬜ Eşik kaybında yönetimsiz kipe düşme (11.3): süre dolunca askıya düşer, ayrı süreç yok
+- 🟡 Tanıklık kayıtları ve medyan zaman (13.4): var, üyeler listesinde tanık sayısı görünür. K değeri 3 (açık konu 3). Nedensel sıra yok; oy hakkına Aşama 3'te bağlanacak
 - ⬜ Takma kimliğin ağlar arası isteğe bağlı taşınması (7.2)
 
 ## Aşama 3: Moderasyon (13)

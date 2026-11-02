@@ -44,6 +44,16 @@ data class MeshMessage(
     val outgoing: Boolean,
 )
 
+/** Bir üyenin katılımını gördüğünü imzalayan tanık (Bölüm 13.4). */
+@Serializable
+data class MeshWitness(val subject: String, val witness: String, val observedAt: Long)
+
+/**
+ * Süre, tanıkların gözlem zamanlarının medyanıyla ölçülür: tek bir cihazın saati sonucu değiştiremez.
+ * [medianObservedAt] yalnız en az K tanık varsa doludur. Tanıklar da sahte kimlik olabilir (Bölüm 7.5).
+ */
+data class WitnessSummary(val witnesses: Int, val medianObservedAt: Long?)
+
 @Serializable
 data class MeshStored(val id: String, val wire: MeshWire, val receivedAt: Long)
 
@@ -53,6 +63,7 @@ data class MeshPersist(
     val seen: List<String> = emptyList(),
     val contacts: List<MeshContact> = emptyList(),
     val messages: List<MeshMessage> = emptyList(),
+    val witnesses: List<MeshWitness> = emptyList(),
 )
 
 /**
@@ -76,7 +87,12 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         val boxPub = Noise.publicOf(boxPriv)
     }
 
-    private class Net(val identity: Identity, persisted: MeshPersist?) {
+    private class Net(val identity: Identity, persisted: MeshPersist?, val witnessing: Boolean) {
+        /** konu -> tanık -> gözlem zamanı */
+        val witnesses = HashMap<String, HashMap<String, Long>>().apply {
+            persisted?.witnesses?.forEach { getOrPut(it.subject) { HashMap() }[it.witness] = it.observedAt }
+        }
+
         val envelopes = LinkedHashMap<String, MeshStored>().apply { persisted?.envelopes?.forEach { put(it.id, it) } }
         val seen = LinkedHashSet(persisted?.seen ?: emptyList())
         val contacts = HashMap<String, MeshContact>().apply { persisted?.contacts?.forEach { put(it.id, it) } }
@@ -91,6 +107,9 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
 
     @Serializable
     private data class PublicBody(val text: String)
+
+    @Serializable
+    private data class WitnessBody(val subject: String)
 
     /** Gönderenin imzalı duyurusu içeride: alıcı, kutu anahtarının sahibini böyle kanıtlar. */
     @Serializable
@@ -109,9 +128,9 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         }
     }
 
-    fun register(networkId: String, networkIdBytes: ByteArray, edPrivate: ByteArray, boxPrivate: ByteArray, nick: String) {
+    fun register(networkId: String, networkIdBytes: ByteArray, edPrivate: ByteArray, boxPrivate: ByteArray, nick: String, witnessing: Boolean = false) {
         synchronized(lock) {
-            val net = Net(Identity(networkIdBytes, edPrivate, boxPrivate), persisted[networkId])
+            val net = Net(Identity(networkIdBytes, edPrivate, boxPrivate), persisted[networkId], witnessing)
             nets[networkId] = net
             announce(networkId, nick)
         }
@@ -177,6 +196,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
             val accepted = when (w.kind) {
                 KIND_PRESENCE -> verified(net, w) && acceptPresence(net, w)
                 KIND_PUBLIC -> verified(net, w) && acceptPublic(net, id, w)
+                KIND_WITNESS -> verified(net, w) && acceptWitness(net, w)
                 KIND_DIRECT -> {
                     if (w.author.isNotEmpty() || w.sig.isNotEmpty()) false else {
                         tryOpenDirect(net, id, w)
@@ -196,8 +216,36 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
             enforceQuota(net, w)
             net.version++
             dirty = true
+            if (w.kind == KIND_PRESENCE && net.witnessing) attest(networkId, net, w)
             return true
         }
+    }
+
+    /** Yeni bir üyeyi ilk gördüğünde tanıklık imzalar. Kişisel onay değildir, otomatiktir (Bölüm 13.4). */
+    private fun attest(networkId: String, net: Net, presence: MeshWire) {
+        val subject = sha256(presence.author.unhex()).hex()
+        if (subject == net.identity.id || net.witnesses[subject]?.containsKey(net.identity.id) == true) return
+        val body = JSON.encodeToString(WitnessBody(subject)).encodeToByteArray()
+        ingest(networkId, signed(net, KIND_WITNESS, body))
+    }
+
+    private fun acceptWitness(net: Net, w: MeshWire): Boolean {
+        val raw = decode(w) ?: return false
+        val body = runCatching { JSON.decodeFromString<WitnessBody>(raw.decodeToString()) }.getOrNull() ?: return false
+        if (body.subject.length != 64) return false
+        val witness = sha256(w.author.unhex()).hex()
+        // Kimse kendi tanığı olamaz. Sahte kimlik selinde liste şişmesin.
+        if (witness == body.subject) return false
+        val forSubject = net.witnesses.getOrPut(body.subject) { HashMap() }
+        if (witness !in forSubject && forSubject.size >= MAX_WITNESSES) return true
+        // İlk gözlem geçerli: tanık sonradan tarihi geriye alamaz.
+        if (witness !in forSubject) forSubject[witness] = w.issuedAt
+        return true
+    }
+
+    fun witnessSummary(networkId: String, subject: String, required: Int = DEFAULT_WITNESSES): WitnessSummary = synchronized(lock) {
+        val times = nets[networkId]?.witnesses?.get(subject)?.filterKeys { !isBlocked(it) }?.values?.sorted().orEmpty()
+        WitnessSummary(times.size, if (times.size >= required) times[times.size / 2] else null)
     }
 
     private fun remember(net: Net, id: String) {
@@ -231,6 +279,12 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
             net.contacts[id] = MeshContact(id, p.box, cleanNick(p.nick), w.issuedAt, proven)
         }
         return true
+    }
+
+    /** Kimlik duyurusundaki kutu anahtarının parmak izi; duyuru geçerli değilse null. */
+    fun presenceFingerprint(networkId: String, w: MeshWire): String? {
+        val p = parsePresence(w) ?: return null
+        return runCatching { sha256(p.box.unhex()).hex() }.getOrNull()
     }
 
     private fun parsePresence(w: MeshWire): Presence? {
@@ -384,7 +438,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         }
     }
 
-    fun carriedCount(networkId: String): Int = synchronized(lock) { nets[networkId]?.envelopes?.values?.count { it.wire.kind != KIND_PRESENCE } ?: 0 }
+    fun carriedCount(networkId: String): Int = synchronized(lock) { nets[networkId]?.envelopes?.values?.count { it.wire.kind != KIND_PRESENCE && it.wire.kind != KIND_WITNESS } ?: 0 }
 
     fun ownId(networkId: String): String? = synchronized(lock) { nets[networkId]?.identity?.id }
 
@@ -415,7 +469,7 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         return synchronized(lock) {
             dirty = false
             return nets.mapValues { (_, n) ->
-                MeshPersist(n.envelopes.values.toList(), n.seen.toList(), n.contacts.values.toList(), n.messages.toList())
+                MeshPersist(n.envelopes.values.toList(), n.seen.toList(), n.contacts.values.toList(), n.messages.toList(), n.witnesses.flatMap { (subject, m) -> m.map { (witness, at) -> MeshWitness(subject, witness, at) } })
             }
         }
     }
@@ -437,6 +491,9 @@ class MeshEngine(private val isBlocked: (String) -> Boolean, private val now: ()
         const val KIND_PRESENCE = "presence"
         const val KIND_PUBLIC = "public"
         const val KIND_DIRECT = "direct"
+        const val KIND_WITNESS = "witness"
+        const val DEFAULT_WITNESSES = 3
+        private const val MAX_WITNESSES = 64
         private val JSON = Json { ignoreUnknownKeys = true }
 
         fun generateSigningKey(): ByteArray = platformCrypto.ed25519GeneratePrivate()

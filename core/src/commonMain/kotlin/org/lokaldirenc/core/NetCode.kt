@@ -53,6 +53,13 @@ object NetCode {
     fun bleToken(discoveryKey: ByteArray, epoch: Long): ByteArray =
         platformCrypto.hmacSha256(discoveryKey, "LD-BLE-v1|$epoch".encodeToByteArray()).copyOf(BleAdvert.TOKEN)
 
+    /**
+     * Yönetilen ağda Network ID kamuya açıktır, bu yüzden bunlar sır değildir: yalnız ağları
+     * birbirinden ayırır. Davetli modda erişimi üyelik kanıtı belirler (Bölüm 6.2).
+     */
+    fun managedKey(networkId: ByteArray, purpose: String): ByteArray =
+        platformCrypto.hkdfSha256(networkId, "LD-MANAGED-v1|$purpose".encodeToByteArray(), 32)
+
     private fun body(code: String) = code.take(BODY)
 
     private fun derive(code: String, info: String): ByteArray =

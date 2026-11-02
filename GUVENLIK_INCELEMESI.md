@@ -31,6 +31,13 @@ Düzeltilmedi. Çoğu tasarım kararı gerektiriyor. Önem sırası yazarın de�
 
 ### Orta
 
+- **Ağ sırrı yenileme sınırları.** İptal edilen üye yeni sırrı alamaz, ama eski sırla kaydettiği çerçeveler ona açık kalır. Yeni sır yalnız öneren yöneticinin tanıdığı üyelere gider; görmediği üye dışarıda kalır ve yeniden davet ister. Mühür sayısı üye sayısını belli eder. Eski sır 72 saat el sıkışmaya yarar: içerik vermez, ama üye olmayan bu sürede zinciri görebilir.
+- **Tanıklık sahte kimliklere karşı kanıt değildir.** Yeni kimlik bedava olduğundan tanık da üretilebilir. Süreyi tek cihazın saatinden korur, kişi sayısını kanıtlamaz (Bölüm 7.5). Oy hakkına bağlanırken katılım geçmişi de aranmalı.
+- **Davet sızıntısı.** Bağlantıyı ilk kullanan üye olur ve bağlantı ağ sırrını içerir, kullanılmasa da sırrı öğrenen dışarıdan LoRa okuyabilir. Tek kullanım cihaz başına sayılır. Süre cihaz saatine dayandığı için kanıt geçmiş tarihli üretilebilir; tanıklık gelene kadar açık.
+- **Karma ağda LoRa.** Sır herkese açık olduğundan, LoRa'dan yalnız daha önce üye olarak görülmüş yazarlar kabul edilir; özel mesajların yazarı görünmez, bunlar kabul edilir.
+- **Anahtar çalınması.** Eşik kadar anahtar çalınırsa saldırgan ayarları ve yöneticileri değiştirebilir, üye iptal edebilir veya ağı sonlandırabilir; mesaj okuyamaz, veri silemez. Eşiğin altındaysa kalan yöneticiler anahtarı değiştirebilir.
+- **Yönetici sayısı.** İki yöneticili ağda biri telefonunu kaybederse karar alınamaz. Ekran üç yönetici öneriyor, zorlamıyor.
+
 6. **Trafikten tanınma.** Keşif paketleri şifreli ama sabit porttan (47474), sabit boyda (268 bayt) ve 3 saniyede bir gider. Ağı izleyen biri içeriği okuyamasa da uygulamanın çalıştığını anlayabilir. "Şifreli iletişim yazılımı kullanmanın" hukuki riski (Bölüm 18) düşünülünce önemli. BLE reklamının biçimi de benzer şekilde sabit.
 7. **Mühürlü zarf seli.** Yazarı görünmediği için üye, 300 zarflık toplam kotayı doldurup başkalarının özel mesajlarını düşürebilir.
 8. **İstasyon kimlik doğrulamaz.** Bluetooth ile bağlanan herkes çerçeve yazıp istasyonun yayın süresi hakkını tüketebilir; Wi-Fi ağı da açık. Anahtarsız tasarımın bedeli. Radyo karıştırma ise zaten engellenemez.

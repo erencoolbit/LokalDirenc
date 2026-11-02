@@ -10,7 +10,18 @@ const val PURPOSE_MESH = "mesh"
 @Serializable
 sealed class Msg {
     @Serializable @SerialName("hello")
-    data class Hello(val proto: Int, val nick: String, val purpose: String = PURPOSE_TRANSFER) : Msg()
+    data class Hello(val proto: Int, val nick: String, val purpose: String = PURPOSE_TRANSFER, val membership: MembershipProof? = null, val admin: GovernanceSignature? = null) : Msg()
+
+    /** Yönetim zinciri eşitlemesi: yalnız yönetilen ağlarda. */
+    @Serializable @SerialName("gov_have")
+    data class GovHave(val count: Long, val lastHash: String) : Msg()
+
+    @Serializable @SerialName("gov_events")
+    data class GovEvents(val events: List<GovernanceEvent>) : Msg()
+
+    /** Yöneticilerin imzasını bekleyen kararlar ve davetler. */
+    @Serializable @SerialName("gov_proposals")
+    data class GovProposals(val proposals: List<Proposal>) : Msg()
 
     /** Mesh eşitlemesi: iletilebilir zarf kimlikleri ve gönderenin kendi duyurusu. */
     @Serializable @SerialName("mesh_inv")

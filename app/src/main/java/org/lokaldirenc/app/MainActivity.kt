@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -22,6 +23,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -52,9 +54,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -73,6 +72,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.zxing.BarcodeFormat
@@ -80,6 +80,8 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.delay
+import org.lokaldirenc.core.ManagedLinks
+import org.lokaldirenc.core.ManagementMode
 import org.lokaldirenc.core.MeshContact
 import org.lokaldirenc.core.MeshEngine
 import org.lokaldirenc.core.MeshMessage
@@ -97,15 +99,11 @@ import java.net.InetAddress
 import java.util.Locale
 import kotlin.concurrent.thread
 
-private val Warn = Color(0xFFB3261E)
-private val Caution = Color(0xFF9A6700)
-private val Ok = Color(0xFF1B6E4F)
-
 /**
  * Düğüm durumu Compose dışında yaşar. Bunu okuyan her ekran bu değeri okuyarak
  * düğüm değiştikçe ve eş listesinin süresi için saniyede bir yeniden çizilir.
  */
-private val LocalTick = compositionLocalOf { 0 }
+internal val LocalTick = compositionLocalOf { 0 }
 
 private sealed class Screen {
     data object Home : Screen()
@@ -114,6 +112,8 @@ private sealed class Screen {
     data object Settings : Screen()
     data object ShareApp : Screen()
     data object Emergency : Screen()
+    data object ManagedSetup : Screen()
+    data class Manage(val id: String) : Screen()
 }
 
 class MainActivity : ComponentActivity() {
@@ -122,14 +122,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val app = application as App
         setContent {
-            val dark = isSystemInDarkTheme()
-            MaterialTheme(
-                colorScheme = if (dark) {
-                    darkColorScheme(primary = Color(0xFF8FD3B6), onPrimary = Color(0xFF0B2A20), secondary = Color(0xFFF2C14E))
-                } else {
-                    lightColorScheme(primary = Color(0xFF14523E), onPrimary = Color.White, secondary = Color(0xFF8A6A00), surfaceVariant = Color(0xFFEDEFEA))
-                },
-            ) {
+            app.revision.intValue
+            val dark = isDarkTheme(app.node.value?.snapshot()?.theme ?: "system")
+            DisposableEffect(dark) {
+                // Durum çubuğu simgeleri seçilen moda uysun.
+                val bars = if (dark) SystemBarStyle.dark(android.graphics.Color.TRANSPARENT) else SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
+                onDispose {}
+            }
+            LokalTheme(dark) {
                 val node = app.node.value
                 val revision = app.revision.intValue
                 var clock by remember { mutableIntStateOf(0) }
@@ -157,16 +158,22 @@ private fun Root(app: App, node: Node) {
         screen = when (val s = screen) {
             is Screen.Messages -> Screen.Network(s.id)
             Screen.ShareApp -> Screen.Settings
+            is Screen.Manage -> Screen.Network(s.id)
             else -> Screen.Home
         }
     }
     Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
         when (val s = screen) {
-            Screen.Home -> HomeScreen(node, onOpen = { screen = Screen.Network(it) }, onSettings = { screen = Screen.Settings }, onEmergency = { screen = Screen.Emergency })
+            Screen.Home -> HomeScreen(node, onOpen = { screen = Screen.Network(it) }, onSettings = { screen = Screen.Settings }, onEmergency = { screen = Screen.Emergency }, onManaged = { screen = Screen.ManagedSetup })
+            Screen.ManagedSetup -> ManagedSetupScreen(node, onOpen = { screen = Screen.Network(it) }) { screen = Screen.Home }
+            is Screen.Manage -> {
+                val net = node.networks().firstOrNull { it.id == s.id }
+                if (net == null) screen = Screen.Home else ManageScreen(node, net) { screen = Screen.Network(s.id) }
+            }
             Screen.Emergency -> EmergencyScreen(app) { screen = Screen.Home }
             is Screen.Network -> {
                 val net = node.networks().firstOrNull { it.id == s.id }
-                if (net == null) screen = Screen.Home else NetworkScreen(node, net, onMessages = { screen = Screen.Messages(s.id) }) { screen = Screen.Home }
+                if (net == null) screen = Screen.Home else NetworkScreen(node, net, onMessages = { screen = Screen.Messages(s.id) }, onManage = { screen = Screen.Manage(s.id) }) { screen = Screen.Home }
             }
             is Screen.Messages -> {
                 val net = node.networks().firstOrNull { it.id == s.id }
@@ -181,7 +188,7 @@ private fun Root(app: App, node: Node) {
 }
 
 @Composable
-private fun Header(title: String, onBack: (() -> Unit)? = null, action: (@Composable () -> Unit)? = null) {
+internal fun Header(title: String, onBack: (() -> Unit)? = null, action: (@Composable () -> Unit)? = null) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         if (onBack != null) TextButton(onClick = onBack) { Text("‹ Geri") } else Spacer(Modifier.width(8.dp))
         Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).padding(horizontal = 4.dp), maxLines = 1)
@@ -191,19 +198,19 @@ private fun Header(title: String, onBack: (() -> Unit)? = null, action: (@Compos
 }
 
 @Composable
-private fun SectionTitle(text: String) {
+internal fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 16.dp, bottom = 8.dp))
 }
 
 @Composable
-private fun Muted(text: String, modifier: Modifier = Modifier) {
+internal fun Muted(text: String, modifier: Modifier = Modifier) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = modifier)
 }
 
 // ---- Ana ekran ----
 
 @Composable
-private fun HomeScreen(node: Node, onOpen: (String) -> Unit, onSettings: () -> Unit, onEmergency: () -> Unit) {
+private fun HomeScreen(node: Node, onOpen: (String) -> Unit, onSettings: () -> Unit, onEmergency: () -> Unit, onManaged: () -> Unit) {
     LocalTick.current
     val networks = node.networks().map { it to node.peers(it.id).size }
     var creating by remember { mutableStateOf(false) }
@@ -214,8 +221,31 @@ private fun HomeScreen(node: Node, onOpen: (String) -> Unit, onSettings: () -> U
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         item {
             Spacer(Modifier.height(12.dp))
-            Text("İnternet olmadan, aynı Wi-Fi veya hotspot üzerindeki cihazlarla şifreli dosya paylaşın.", style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(16.dp))
+            Button(onClick = onEmergency, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger), modifier = Modifier.fillMaxWidth()) {
+                Text(if (SosState.active) "Yardım sinyali açık" else "Acil durum", fontWeight = FontWeight.SemiBold)
+            }
+            SectionTitle("Ağlarım")
+            if (networks.isEmpty()) {
+                Text("İnternet olmadan, aynı Wi-Fi veya hotspot üzerindeki cihazlarla şifreli mesaj ve dosya paylaşın.", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(4.dp))
+                Muted("Başlamak için bir ağ kurun veya bir ağa katılın.")
+            }
+        }
+        networks.forEach { (net, count) ->
+            item(key = net.id) {
+                Card(Modifier.fillMaxWidth().padding(bottom = 8.dp).clickable { onOpen(net.id) }) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(net.name, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f), maxLines = 1)
+                            if (net.managed) Text("Yönetilen", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                        Muted(if (count == 0) "Yakında cihaz görünmüyor" else "Yakında $count cihaz")
+                    }
+                }
+            }
+        }
+        item {
+            SectionTitle("Ağ ekle")
             Button(onClick = { creating = true }, modifier = Modifier.fillMaxWidth()) { Text("Yeni ağ kur") }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -228,21 +258,8 @@ private fun HomeScreen(node: Node, onOpen: (String) -> Unit, onSettings: () -> U
                 OutlinedButton(onClick = { joining = "" }, modifier = Modifier.weight(1f)) { Text("Kodla katıl") }
             }
             Spacer(Modifier.height(8.dp))
-            Button(onClick = onEmergency, colors = ButtonDefaults.buttonColors(containerColor = Warn), modifier = Modifier.fillMaxWidth()) {
-                Text(if (SosState.active) "Yardım sinyali açık" else "Acil durum")
-            }
-            SectionTitle("Ağlarım")
-            if (networks.isEmpty()) Muted("Henüz bir ağa katılmadınız.")
-        }
-        networks.forEach { (net, count) ->
-            item(key = net.id) {
-                Card(Modifier.fillMaxWidth().padding(bottom = 8.dp).clickable { onOpen(net.id) }) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(net.name, style = MaterialTheme.typography.titleMedium)
-                        Muted(if (count == 0) "Yakında cihaz görünmüyor" else "Yakında $count cihaz")
-                    }
-                }
-            }
+            OutlinedButton(onClick = onManaged, modifier = Modifier.fillMaxWidth()) { Text("Yönetilen ağ kur veya imzala") }
+            Spacer(Modifier.height(16.dp))
         }
     }
 
@@ -278,7 +295,10 @@ private fun JoinDialog(node: Node, prefill: String, onDismiss: () -> Unit, onJoi
         title = { Text("Ağa katıl") },
         text = {
             Column {
-                OutlinedTextField(code, { code = it; error = null }, label = { Text("Ağ kodu") }, isError = error != null, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(code, { code = it; error = null }, label = { Text("Ağ kodu") }, isError = error != null, keyboardOptions = CodeKeyboard, modifier = Modifier.fillMaxWidth())
+                ManagedLinks.takeIf { it.isJoin(code) }?.parseJoin(code)?.let { join ->
+                    Muted("Yönetilen ağ: ${join.name}. ${modeName(join.modeHint)}. Kural, ağa bağlanınca imzalı kayıttan doğrulanır.", Modifier.padding(top = 4.dp))
+                }
                 error?.let { Text(it, color = Warn, style = MaterialTheme.typography.bodySmall) }
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(name, { name = it.take(40) }, label = { Text("Ağ adı (yalnız sizde görünür)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
@@ -287,7 +307,7 @@ private fun JoinDialog(node: Node, prefill: String, onDismiss: () -> Unit, onJoi
         confirmButton = {
             Button(onClick = {
                 try {
-                    onJoined(node.joinNetwork(code, name).id)
+                    onJoined(if (ManagedLinks.isJoin(code)) node.joinWithLink(code).id else node.joinNetwork(code, name).id)
                 } catch (e: IllegalArgumentException) {
                     error = e.message
                 }
@@ -300,7 +320,7 @@ private fun JoinDialog(node: Node, prefill: String, onDismiss: () -> Unit, onJoi
 // ---- Ağ ekranı ----
 
 @Composable
-private fun NetworkScreen(node: Node, net: NetworkInfo, onMessages: () -> Unit, onBack: () -> Unit) {
+private fun NetworkScreen(node: Node, net: NetworkInfo, onMessages: () -> Unit, onManage: () -> Unit, onBack: () -> Unit) {
     LocalTick.current
     val context = LocalContext.current
     var showCode by remember { mutableStateOf(false) }
@@ -347,6 +367,17 @@ private fun NetworkScreen(node: Node, net: NetworkInfo, onMessages: () -> Unit, 
                     Muted("$messageCount mesaj · bu cihaz $carried zarf taşıyor")
                 }
             }
+            if (net.managed) {
+                Spacer(Modifier.height(8.dp))
+                val log = node.governance(net.id)
+                val waiting = if (node.isAdmin(net.id)) node.pendingProposals(net.id).count { !node.hasSigned(net.id, it) } else 0
+                Card(Modifier.fillMaxWidth().clickable(onClick = onManage)) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Yönetim", style = MaterialTheme.typography.titleMedium)
+                        Muted((log?.definition?.let { modeName(it.entryMode) } ?: "Kurallar bekleniyor") + if (waiting > 0) " · $waiting onay bekliyor" else "")
+                    }
+                }
+            }
             SectionTitle("Yakındaki cihazlar")
             if (peers.isEmpty()) Muted("Aynı Wi-Fi veya hotspot'a bağlı, bu ağın kodunu bilen cihazlar burada görünür.")
         }
@@ -380,13 +411,17 @@ private fun NetworkScreen(node: Node, net: NetworkInfo, onMessages: () -> Unit, 
         }
     }
 
-    if (showCode) CodeDialog(net) { showCode = false }
+    if (showCode) CodeDialog(net, node) { showCode = false }
+    var retiredSeen by remember { mutableStateOf(false) }
+    if (!retiredSeen && node.governance(net.id)?.mode == ManagementMode.RETIRED) {
+        RetiredDialog(node, net, onDismiss = { retiredSeen = true }, onLeft = onBack)
+    }
     if (confirmLeave) {
         AlertDialog(
             onDismissRequest = { confirmLeave = false },
             title = { Text("Ağdan ayrıl?") },
             text = { Text("Bu ağdaki kimliğiniz ve kayıtlarınız silinir. Aynı kodla yeniden katılırsanız yeni bir kimlikle görünürsünüz.") },
-            confirmButton = { Button(onClick = { node.leaveNetwork(net.id); confirmLeave = false; onBack() }, colors = ButtonDefaults.buttonColors(containerColor = Warn)) { Text("Ayrıl") } },
+            confirmButton = { Button(onClick = { node.leaveNetwork(net.id); confirmLeave = false; onBack() }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger)) { Text("Ayrıl") } },
             dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text("Vazgeç") } },
         )
     }
@@ -521,7 +556,7 @@ private fun MethodChip(icon: Int, name: String, facts: String, active: Boolean, 
         Column(Modifier.padding(horizontal = 6.dp, vertical = 6.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(painterResource(icon), null, tint = tint, modifier = Modifier.size(20.dp))
             Text(name, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            Text(facts, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+            Text(facts, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(if (active) "Açık" else "Kapalı", style = MaterialTheme.typography.labelSmall, color = tint, fontWeight = FontWeight.Medium)
         }
     }
@@ -613,7 +648,7 @@ private fun EmergencyScreen(app: App, onBack: () -> Unit) {
         Spacer(Modifier.height(12.dp))
         Button(onClick = {
             runCatching { context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:112"))) }
-        }, colors = ButtonDefaults.buttonColors(containerColor = Warn), modifier = Modifier.fillMaxWidth()) { Text("112'yi ara") }
+        }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger), modifier = Modifier.fillMaxWidth()) { Text("112'yi ara") }
         Muted("Şebeke varsa önce bunu deneyin.", Modifier.padding(top = 4.dp))
 
         SectionTitle("Yardım sinyali")
@@ -641,7 +676,7 @@ private fun EmergencyScreen(app: App, onBack: () -> Unit) {
                 if (Build.VERSION.SDK_INT >= 33) missing += Manifest.permission.POST_NOTIFICATIONS
                 val needed = missing.filter { context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
                 if (needed.isEmpty()) startSignal() else signalPermissions.launch(needed.toTypedArray())
-            }, colors = ButtonDefaults.buttonColors(containerColor = Warn), modifier = Modifier.fillMaxWidth()) { Text("Yardım sinyali yayınla") }
+            }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger), modifier = Modifier.fillMaxWidth()) { Text("Yardım sinyali yayınla") }
         }
         Spacer(Modifier.height(8.dp))
         Text("Bu özellik kurtarılacağınızı garanti etmez. Beton sinyali çok zayıflatır, kurtarma ekipleri bu sinyali dinliyor olmayabilir, pil ömrü de ölçülmedi. Yayın herkese açıktır ve kim olduğunuzu veya konumunuzu içermez. Düdük bulunduğunuz yeri belli eder.", color = Caution, style = MaterialTheme.typography.bodySmall)
@@ -653,7 +688,7 @@ private fun EmergencyScreen(app: App, onBack: () -> Unit) {
         val heard = app.sosListener.current()
         if (listening && heard.isEmpty()) Muted("Dinleniyor. Bu ekran açıkken duyulan çağrılar burada görünür.")
         heard.forEach { h ->
-            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Warn.copy(alpha = 0.10f))) {
+            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Warn.copy(alpha = 0.14f))) {
                 Column(Modifier.padding(12.dp)) {
                     Text("Yardım çağrısı #${(h.session and 0xFFFF).toString(16).uppercase()}", fontWeight = FontWeight.SemiBold)
                     val strength = when {
@@ -763,27 +798,36 @@ private fun ManualAddress(net: NetworkInfo, node: Node, value: String, onChange:
 }
 
 @Composable
-private fun CodeDialog(net: NetworkInfo, onDismiss: () -> Unit) {
-    val qr = remember(net.code) { qrBitmap(NetCode.qrPayload(net.code), 640) }
+private fun CodeDialog(net: NetworkInfo, node: Node, onDismiss: () -> Unit) {
+    val link = if (net.managed) node.joinLink(net.id) else NetCode.qrPayload(net.code)
+    val qr = remember(link) { link?.let { qrBitmap(it, 640) } }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Ağ kodu") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(Modifier.background(Color.White, RoundedCornerShape(8.dp)).padding(8.dp)) {
-                    Image(qr.asImageBitmap(), "Ağ kodu QR", Modifier.size(232.dp))
+                if (qr == null) {
+                    Text(if (node.governance(net.id)?.definition == null) "Ağın kuralları henüz alınmadı." else "Bu ağ davetli. Girmek için yöneticiden davet istenmeli: Yönetim > Davet oluştur.")
+                } else {
+                    Box(Modifier.background(Color.White, RoundedCornerShape(8.dp)).padding(8.dp)) {
+                        Image(qr.asImageBitmap(), "Ağ kodu QR", Modifier.size(232.dp))
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    if (net.managed) {
+                        Text(link ?: "", fontFamily = FontFamily.Monospace, fontSize = 7.sp, lineHeight = 8.sp)
+                    } else {
+                        Text(NetCode.format(net.code), fontFamily = FontFamily.Monospace, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Bu kod ortak sırdır. Bilen herkes ağa bağlanabilir; sızarsa geri alınamaz, yeni ağ kurmanız gerekir.", color = Caution, style = MaterialTheme.typography.bodySmall)
                 }
-                Spacer(Modifier.height(12.dp))
-                Text(NetCode.format(net.code), fontFamily = FontFamily.Monospace, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Spacer(Modifier.height(12.dp))
-                Text("Bu kod ortak sırdır. Bilen herkes eşit üye olur; sızarsa geri alınamaz, yeni ağ kurmanız gerekir.", color = Caution, style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Kapat") } },
     )
 }
 
-private fun qrBitmap(text: String, size: Int): Bitmap {
+internal fun qrBitmap(text: String, size: Int): Bitmap {
     val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
     val pixels = IntArray(size * size) { i -> if (matrix.get(i % size, i / size)) 0xFF000000.toInt() else 0xFFFFFFFF.toInt() }
     return Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
@@ -809,7 +853,7 @@ private fun TransferCard(node: Node, t: Transfer, onSave: () -> Unit) {
     var confirmRelease by remember { mutableStateOf(false) }
     Card(
         Modifier.fillMaxWidth().padding(bottom = 8.dp),
-        colors = if (t.quarantined) CardDefaults.cardColors(containerColor = Warn.copy(alpha = 0.10f)) else CardDefaults.cardColors(),
+        colors = if (t.quarantined) CardDefaults.cardColors(containerColor = Warn.copy(alpha = 0.14f)) else CardDefaults.cardColors(),
     ) {
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp)) {
             Text((if (t.outgoing) "↑ " else "↓ ") + t.fileName, style = MaterialTheme.typography.titleSmall, maxLines = 2)
@@ -853,7 +897,7 @@ private fun TransferCard(node: Node, t: Transfer, onSave: () -> Unit) {
                     Text("Yalnız gönderene güveniyorsanız devam edin. Uygulama dosyayı yine de açmaz.")
                 }
             },
-            confirmButton = { Button(onClick = { node.releaseFromQuarantine(t.id); confirmRelease = false }, colors = ButtonDefaults.buttonColors(containerColor = Warn)) { Text("Riski kabul ediyorum") } },
+            confirmButton = { Button(onClick = { node.releaseFromQuarantine(t.id); confirmRelease = false }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger)) { Text("Riski kabul ediyorum") } },
             dismissButton = { TextButton(onClick = { confirmRelease = false }) { Text("Vazgeç") } },
         )
     }
@@ -908,6 +952,18 @@ private fun SettingsScreen(app: App, node: Node, onShare: () -> Unit, onBack: ()
     val context = LocalContext.current
     Header("Ayarlar", onBack)
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
+        SectionTitle("Görünüm")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            listOf("system" to "Sistem", "light" to "Aydınlık", "dark" to "Karanlık").forEach { (value, label) ->
+                val chosen = state.theme == value
+                if (chosen) {
+                    Button(onClick = {}, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 4.dp)) { Text(label, maxLines = 1) }
+                } else {
+                    OutlinedButton(onClick = { node.setTheme(value) }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 4.dp)) { Text(label, maxLines = 1) }
+                }
+            }
+        }
+
         SectionTitle("Uygulamayı paylaş")
         Muted("Uygulaması olmayan birine kurulum paketini gönderin.")
         Spacer(Modifier.height(8.dp))
@@ -956,7 +1012,7 @@ private fun SettingsScreen(app: App, node: Node, onShare: () -> Unit, onBack: ()
         SectionTitle("Panik silme")
         Muted("Bu cihazdaki tüm ağları, kimlikleri, kayıtları ve alınan dosyaları siler. Başka cihazlardaki kopyalara ve cihaza kaydettiğiniz dosyalara dokunmaz.")
         Spacer(Modifier.height(8.dp))
-        Button(onClick = { panic = true }, colors = ButtonDefaults.buttonColors(containerColor = Warn), modifier = Modifier.fillMaxWidth()) { Text("Her şeyi sil") }
+        Button(onClick = { panic = true }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger), modifier = Modifier.fillMaxWidth()) { Text("Her şeyi sil") }
         Spacer(Modifier.height(24.dp))
     }
     if (panic) {
@@ -970,7 +1026,7 @@ private fun SettingsScreen(app: App, node: Node, onShare: () -> Unit, onBack: ()
                     app.panicWipe()
                     Toast.makeText(context, "Silindi", Toast.LENGTH_SHORT).show()
                     onBack()
-                }, colors = ButtonDefaults.buttonColors(containerColor = Warn)) { Text("Evet, sil") }
+                }, colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = OnDanger)) { Text("Evet, sil") }
             },
             dismissButton = { TextButton(onClick = { panic = false }) { Text("Vazgeç") } },
         )

@@ -45,7 +45,10 @@ object GovernanceTypes {
     const val RETIRE_ANNOUNCE = "retire_announce"
     const val RETIRE_CANCEL = "retire_cancel"
     const val RETIRE_NOW = "retire_now"
-    val ALLOWED = setOf(GENESIS, DEFINITION, KEY_ROTATION, TERM_RENEW, RETIRE_ANNOUNCE, RETIRE_CANCEL, RETIRE_NOW)
+    const val MEMBER_REVOKE = "member_revoke"
+    const val INVITE_REVOKE = "invite_revoke"
+    const val SECRET_ROTATE = "secret_rotate"
+    val ALLOWED = setOf(GENESIS, DEFINITION, KEY_ROTATION, TERM_RENEW, RETIRE_ANNOUNCE, RETIRE_CANCEL, RETIRE_NOW, MEMBER_REVOKE, INVITE_REVOKE, SECRET_ROTATE)
 }
 
 @Serializable
@@ -100,6 +103,13 @@ data class TermPayload(val adminTermExpiry: Long)
 @Serializable
 data class RetirePayload(val reason: String = "")
 
+/**
+ * Yeni ağ sırrı, her üye için ayrı mühürlenir: iptal edilen kişiye mühür yoktur, zinciri görse de
+ * açamaz. Mühürler alıcı adı taşımaz; her üye açmayı dener.
+ */
+@Serializable
+data class SecretRotation(val epoch: Int, val sealed: List<String>)
+
 enum class GovernanceReject {
     WRONG_NETWORK, NOT_ALLOWED, BAD_SEQUENCE, FORK, BROKEN_CHAIN, NOT_ENOUGH_SIGNATURES,
     BAD_PAYLOAD, BAD_TERM, TERM_EXPIRED, RETIRED, CLOCK, NOTHING_TO_CANCEL,
@@ -140,8 +150,19 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
     var retireEffectiveAt: Long? = null
         private set
 
+    /** Yalnız davetli ve karma modda anlamlıdır. Veriye dokunmaz, yeni oturumları etkiler (Bölüm 5.5). */
+    val revokedMembers = HashSet<String>()
+    val revokedInvites = HashSet<String>()
+
+    var secretEpoch = 0
+        private set
+
     private var retiredNow = false
     private val applied = HashMap<Long, String>()
+    private val appliedEvents = ArrayList<GovernanceEvent>()
+
+    /** Uygulanan olaylar: başka düğümlere iletmek için. */
+    val events: List<GovernanceEvent> get() = appliedEvents.toList()
 
     val mode: ManagementMode
         get() {
@@ -206,6 +227,20 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
                     if (retireEffectiveAt == null) fail(GovernanceReject.NOTHING_TO_CANCEL)
                     retireEffectiveAt = null
                 }
+                GovernanceTypes.MEMBER_REVOKE -> {
+                    if (suspended) fail(GovernanceReject.TERM_EXPIRED)
+                    revokedMembers += (parse<RevokePayload>(e.payload) ?: fail(GovernanceReject.BAD_PAYLOAD)).value
+                }
+                GovernanceTypes.INVITE_REVOKE -> {
+                    if (suspended) fail(GovernanceReject.TERM_EXPIRED)
+                    revokedInvites += (parse<RevokePayload>(e.payload) ?: fail(GovernanceReject.BAD_PAYLOAD)).value
+                }
+                GovernanceTypes.SECRET_ROTATE -> {
+                    // Askıda da açık: sızan sır yetki süresini beklemeden değiştirilebilmeli.
+                    val r = parse<SecretRotation>(e.payload) ?: fail(GovernanceReject.BAD_PAYLOAD)
+                    if (r.epoch != secretEpoch + 1 || r.sealed.isEmpty() || r.sealed.size > MAX_SEALED) fail(GovernanceReject.BAD_PAYLOAD)
+                    secretEpoch = r.epoch
+                }
                 GovernanceTypes.RETIRE_NOW -> {
                     parse<RetirePayload>(e.payload) ?: fail(GovernanceReject.BAD_PAYLOAD)
                     retiredNow = true
@@ -214,6 +249,7 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
             }
         }
         applied[e.sequence] = e.hash()
+        appliedEvents += e
         lastHash = e.hash()
         nextSequence = e.sequence + 1
     }
@@ -229,6 +265,7 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
 
     companion object {
         const val RETIRE_WAIT_MS = 72L * 3_600_000
+        const val MAX_SEALED = 2000
         const val DEFAULT_TERM_MS = 183L * 24 * 3_600_000
 
         /** Süresiz yöneticiyi önler. Belgedeki öneri 6 ay; yenilenebilir üst sınır 1 yıl. */
@@ -244,6 +281,22 @@ class GovernanceLog private constructor(val networkId: String, private val now: 
         fun encode(value: RotationPayload) = JSON.encodeToString(RotationPayload.serializer(), value)
         fun encode(value: TermPayload) = JSON.encodeToString(TermPayload.serializer(), value)
         fun encode(value: RetirePayload) = JSON.encodeToString(RetirePayload.serializer(), value)
+        fun decodeDefinition(text: String): NetworkDefinition? = parse(text)
+
+        fun decodeRevoke(text: String): RevokePayload? = parse(text)
+
+        fun encode(value: SecretRotation) = JSON.encodeToString(SecretRotation.serializer(), value)
+
+        fun decodeRotation(text: String): SecretRotation? = parse(text)
+
+        fun decodeKeyRotation(text: String): RotationPayload? = parse(text)
+
+        fun encode(value: RevokePayload) = JSON.encodeToString(RevokePayload.serializer(), value)
+
+        fun decodeGenesis(text: String): GenesisPayload? = parse(text)
+
+        /** Zinciri henüz almamış katılımcı için: kimlik QR'dan bilinir, olaylar eşlerden gelir. */
+        fun empty(expectedNetworkId: String, now: () -> Long = ::currentTimeMillis) = GovernanceLog(expectedNetworkId, now)
 
         private inline fun <reified T> parse(text: String): T? =
             runCatching { JSON.decodeFromString<T>(text) }.getOrNull()

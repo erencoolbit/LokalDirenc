@@ -52,6 +52,8 @@ data class NodeConfig(
     val meshResyncMs: Long = 30_000,
     /** Tüm durum her yazımda yeniden şifrelenir; sık yazmak pil harcar. Kapanışta da yazılır. */
     val meshFlushMs: Long = 10_000,
+    /** Sır değişince eski sır yalnız yeni sırrı almak için bu kadar geçerli kalır. */
+    val secretGraceMs: Long = 72L * 3_600_000,
 )
 
 enum class TransferStatus { PREPARING, CONNECTING, PAIRING, AWAIT_ACCEPT, WAITING_PEER, TRANSFERRING, VERIFYING, DONE, REJECTED, FAILED }
@@ -89,7 +91,9 @@ data class Transfer(
 data class Peer(val networkId: String, val host: String, val port: Int, val fingerprint: String?, val nick: String, val trusted: Boolean, val lastSeen: Long)
 
 @Serializable
-data class StoredNetwork(val code: String, val name: String, val staticKey: String, val createdAt: Long, val meshKey: String = "")
+data class StoredNetwork(val code: String, val name: String, val staticKey: String, val createdAt: Long, val meshKey: String = "", val managedId: String = "", val secret: String = "", val previousSecret: String = "", val previousUntil: Long = 0, val secretMissed: Boolean = false) {
+    val networkId: String get() = managedId.ifEmpty { NetCode.networkId(code).hex() }
+}
 
 @Serializable
 data class TrustedPeer(val networkId: String, val fingerprint: String, val nick: String)
@@ -105,12 +109,24 @@ data class NodeState(
     val retentionHours: Int = 24 * 7,
     val mesh: Map<String, MeshPersist> = emptyMap(),
     val bluetoothEnabled: Boolean = false,
+    /** system, light veya dark */
+    val theme: String = "system",
+    val governance: Map<String, List<GovernanceEvent>> = emptyMap(),
+    val memberships: Map<String, MembershipProof> = emptyMap(),
+    val inviteUses: Map<String, List<String>> = emptyMap(),
+    /** Yönetici anahtarları: durum dosyası Keystore anahtarıyla şifrelidir. */
+    val adminKeys: Map<String, String> = emptyMap(),
+    /** Henüz bir ağa bağlanmamış, koduyla paylaşılan yönetici anahtarı. */
+    val adminKeyPool: String = "",
+    val proposals: Map<String, List<Proposal>> = emptyMap(),
+    /** Oluşturduğumuz davetlerin sırları: imzalar tamamlanınca davet bağlantısı bunlarla yazılır. */
+    val inviteSecrets: Map<String, String> = emptyMap(),
 )
 
-data class NetworkInfo(val id: String, val code: String, val name: String, val fingerprint: String, val port: Int)
+data class NetworkInfo(val id: String, val code: String, val name: String, val fingerprint: String, val port: Int, val managed: Boolean = false)
 
 /**
- * Bir cihazın yönetimsiz ağ düğümü: keşif, el sıkışma, aktarım ve yerel durum.
+ * Bir cihazın ağ düğümü: keşif, el sıkışma, aktarım ve yerel durum.
  * Hiçbir dış sunucuya bağlanmaz. Kayıtlarda dosya içeriği, ağ kodu ve anahtar bulunmaz.
  */
 class Node(private val dir: File, private val store: StateStore, val config: NodeConfig = NodeConfig()) {
@@ -146,13 +162,39 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
 
     val protection get() = store.protection
 
-    private inner class NetRuntime(val network: StoredNetwork) {
-        val id = NetCode.networkId(network.code).hex()
-        val idBytes = NetCode.networkId(network.code)
-        val psk = NetCode.psk(network.code)
-        val discKey = NetCode.discoveryKey(network.code)
-        val loraKey = NetCode.loraKey(network.code)
-        val staticPriv = network.staticKey.unhex()
+    private class KeySet(val secret: String, val psk: ByteArray, val disc: ByteArray, val lora: ByteArray)
+
+    private fun keySetOf(secret: String): KeySet {
+        val raw = secret.unhex()
+        return KeySet(secret, NetCode.managedKey(raw, "psk"), NetCode.managedKey(raw, "disc"), NetCode.managedKey(raw, "lora"))
+    }
+
+    private inner class NetRuntime(initial: StoredNetwork) {
+        @Volatile
+        var network: StoredNetwork = initial
+
+        @Volatile
+        private var cached: Pair<StoredNetwork, List<KeySet>>? = null
+
+        /** Geçerli anahtarlar: ilki güncel. Eskisi yalnız geçiş süresince listededir. */
+        fun keysets(): List<KeySet> {
+            val n = network
+            val list = cached?.takeIf { it.first === n }?.second ?: when {
+                n.managedId.isEmpty() -> listOf(KeySet("", NetCode.psk(n.code), NetCode.discoveryKey(n.code), NetCode.loraKey(n.code)))
+                n.previousSecret.isEmpty() -> listOf(keySetOf(n.secret))
+                else -> listOf(keySetOf(n.secret), keySetOf(n.previousSecret))
+            }.also { cached = n to it }
+            return if (list.size > 1 && System.currentTimeMillis() >= n.previousUntil) list.take(1) else list
+        }
+
+        val psk get() = keysets().first().psk
+        val discKey get() = keysets().first().disc
+        val loraKey get() = keysets().first().lora
+
+        val managed = initial.managedId.isNotEmpty()
+        val id = initial.networkId
+        val idBytes = id.unhex()
+        val staticPriv = initial.staticKey.unhex()
         val fingerprint = sha256(Noise.publicOf(staticPriv)).hex()
         val server = ServerSocket(0)
 
@@ -223,9 +265,389 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     private fun startRuntime(n: StoredNetwork): NetRuntime {
         val rt = NetRuntime(n)
         runtimes[rt.id] = rt
-        mesh.register(rt.id, rt.idBytes, n.meshKey.unhex(), rt.staticPriv, state.nick)
+        if (rt.managed) {
+            val log = GovernanceLog.empty(rt.id)
+            // Kayıtlı zincir de yeniden doğrulanır: diskteki veriye körü körüne güvenilmez.
+            state.governance[rt.id].orEmpty().forEach { e -> runCatching { log.apply(e) } }
+            logs[rt.id] = log
+        }
+        mesh.register(rt.id, rt.idBytes, n.meshKey.unhex(), rt.staticPriv, state.nick, witnessing = rt.managed)
         rt.start()
         return rt
+    }
+
+    // ---- Yönetilen ağ ----
+
+    private val logs = ConcurrentHashMap<String, GovernanceLog>()
+    private val governanceAlerts = ConcurrentHashMap<String, GovernanceReject>()
+
+    /** Eşik kadar imzalı ilk olayla ağı kurar. */
+    fun createManagedNetwork(genesis: GovernanceEvent, secret: String, name: String): NetworkInfo {
+        GovernanceLog.bootstrap(genesis.networkId, listOf(genesis))
+        val info = joinManagedNetwork(genesis.networkId, secret, name)
+        submitGovernance(info.id, genesis)
+        return info
+    }
+
+    /** Katılımcı: kimlik ve sır bağlantıdan gelir, zincir eşlerden alınır ve bu kimliğe karşı doğrulanır. */
+    fun joinManagedNetwork(networkId: String, secret: String, name: String): NetworkInfo {
+        require(networkId.length == 64 && runCatching { networkId.unhex() }.isSuccess) { "Geçersiz ağ kimliği" }
+        require(secret.length == 64 && runCatching { secret.unhex() }.isSuccess) { "Geçersiz ağ sırrı" }
+        runtimes[networkId]?.let { return info(it) }
+        val n = StoredNetwork("", name.take(40).ifBlank { "Ağ ${networkId.take(4)}" }, Noise.generatePrivate().hex(), System.currentTimeMillis(), MeshEngine.generateSigningKey().hex(), networkId, secret)
+        mutate { it.copy(networks = it.networks + n) }
+        val rt = startRuntime(n)
+        notifyChange()
+        return info(rt)
+    }
+
+    /** QR veya davet bağlantısıyla katılır. Geçersizse [IllegalArgumentException] atar. */
+    fun joinWithLink(link: String): NetworkInfo {
+        val join = ManagedLinks.parseJoin(link) ?: throw IllegalArgumentException("Bağlantı geçersiz")
+        val info = joinManagedNetwork(join.networkId, join.secret, join.name)
+        val ticket = join.ticket
+        val secret = join.inviteSecret
+        if (ticket != null && secret != null) redeemInvite(info.id, ticket, secret)
+        return info
+    }
+
+    /** Paylaşılabilir katılma bağlantısı. Davetli ağda sır QR ile dolaşmasın diye yoktur. */
+    fun joinLink(networkId: String): String? {
+        val rt = runtimes[networkId]?.takeIf { it.managed } ?: return null
+        val definition = logs[networkId]?.definition ?: return null
+        if (definition.entryMode == EntryMode.INVITE_ONLY) return null
+        return ManagedLinks.encode(ManagedJoin(networkId, rt.network.secret, definition.name, definition.entryMode))
+    }
+
+    // ---- Ortak imza ----
+
+    /** Başka yöneticilerin kurulacak ağa eklemesi için bu cihazın yönetici kodu. */
+    fun adminCode(): String {
+        val pool = state.adminKeyPool.ifEmpty {
+            val fresh = MeshEngine.generateSigningKey().hex()
+            mutate { it.copy(adminKeyPool = fresh) }
+            fresh
+        }
+        return platformCrypto.ed25519PublicOf(pool.unhex()).hex()
+    }
+
+    /**
+     * Yeni ağın ilk olayını başlatır, kendi anahtarıyla imzalar. Paket diğer yöneticiye gider;
+     * tek cihaz eşiği dolduramaz (Bölüm 11.3).
+     */
+    fun startManagedNetwork(name: String, mode: EntryMode, otherAdminCodes: List<String>, threshold: Int = 2): GenesisBundle {
+        val set = ManagementKeySet(threshold, (listOf(adminCode()) + otherAdminCodes.map { it.trim().lowercase() }).distinct())
+        require(set.isValid()) { "En az $threshold farklı yönetici kodu gerekir" }
+        val time = System.currentTimeMillis()
+        val definition = NetworkDefinition(name.take(40), mode, adminTermExpiry = time + GovernanceLog.DEFAULT_TERM_MS)
+        val secret = platformCrypto.randomBytes(32).hex()
+        return GenesisBundle(GovernanceLog.genesisDraft(set, definition, time).signedBy(state.adminKeyPool.unhex()), secret, name.take(40))
+    }
+
+    class BundleResult(val bundle: GenesisBundle, val network: NetworkInfo?)
+
+    /**
+     * Gelen paketi bu cihazın yönetici anahtarıyla imzalar. Eşik dolduysa ağ burada kurulur;
+     * paket diğer yöneticilere geri verilir ki onlarda da kurulsun.
+     */
+    fun signBundle(bundle: GenesisBundle): BundleResult {
+        val event = bundle.event
+        require(event.type == GovernanceTypes.GENESIS && event.sequence == 0L) { "Bu bir kurulum paketi değil" }
+        val payload = GovernanceLog.decodeGenesis(event.payload) ?: throw IllegalArgumentException("Paket bozuk")
+        require(payload.keys.isValid() && GovernanceLog.networkIdOf(payload.keys) == event.networkId) { "Paket kimliği tutmuyor" }
+        val pool = state.adminKeyPool
+        val mine = pool.takeIf { it.isNotEmpty() && platformCrypto.ed25519PublicOf(it.unhex()).hex() in payload.keys.keys }
+            ?: state.adminKeys[event.networkId]
+            ?: throw IllegalArgumentException("Bu cihazın yönetici kodu bu pakette yok")
+        val signed = event.signedBy(mine.unhex())
+        val result = bundle.copy(event = signed)
+        if (signed.validSignerCount(payload.keys) < payload.keys.threshold) return BundleResult(result, null)
+        val network = createManagedNetwork(signed, bundle.secret, bundle.name)
+        // Anahtar artık bu ağa ait: başka ağda aynı kimlik kullanılmasın (Bölüm 7.2).
+        mutate { it.copy(adminKeys = it.adminKeys + (network.id to mine), adminKeyPool = if (it.adminKeyPool == mine) "" else it.adminKeyPool) }
+        return BundleResult(result, network)
+    }
+
+    fun isAdmin(networkId: String): Boolean = state.adminKeys[networkId]?.let { priv ->
+        logs[networkId]?.keys?.keys?.contains(platformCrypto.ed25519PublicOf(priv.unhex()).hex())
+    } == true
+
+    /** Kararı başlatır ve kendi imzasını atar. Eşik dolunca uygulanır, dolmadıysa eşitlemeyle yayılır. */
+    fun proposeEvent(networkId: String, type: String, payload: String) {
+        val log = logs[networkId] ?: throw IllegalArgumentException("Yönetilen ağ değil")
+        val key = state.adminKeys[networkId] ?: throw IllegalStateException("Bu cihaz yönetici değil")
+        val event = synchronized(log) { log.draft(type, payload) }.signedBy(key.unhex())
+        mergeProposal(networkId, Proposal(event = event))
+    }
+
+    /** Davet oluşturur: imzalar tamamlanınca [readyInvites] içinde görünür. Sır yalnız bu cihazda kalır. */
+    fun proposeInvite(networkId: String, lifetimeMs: Long = Invites.DEFAULT_LIFETIME_MS, maxUses: Int = 1) {
+        val key = state.adminKeys[networkId] ?: throw IllegalStateException("Bu cihaz yönetici değil")
+        val draft = Invites.draft(networkId, System.currentTimeMillis() + lifetimeMs, maxUses)
+        mutate { it.copy(inviteSecrets = it.inviteSecrets + (draft.ticket.inviteId to draft.secret)) }
+        mergeProposal(networkId, Proposal(ticket = draft.ticket.signedBy(key.unhex())))
+    }
+
+    fun pendingProposals(networkId: String): List<Proposal> = state.proposals[networkId].orEmpty()
+
+    /** Bu cihaz imzaladı mı: arayüzde yeniden imza istenmesin. */
+    fun hasSigned(networkId: String, proposal: Proposal): Boolean {
+        val key = state.adminKeys[networkId] ?: return false
+        val public = platformCrypto.ed25519PublicOf(key.unhex()).hex()
+        return proposal.signatures.any { it.key == public }
+    }
+
+    fun approveProposal(networkId: String, proposal: Proposal) {
+        val key = state.adminKeys[networkId] ?: throw IllegalStateException("Bu cihaz yönetici değil")
+        mergeProposal(networkId, Proposal(proposal.event?.signedBy(key.unhex()), proposal.ticket?.signedBy(key.unhex())))
+    }
+
+    fun rejectProposal(networkId: String, proposal: Proposal) {
+        mutate { s -> s.copy(proposals = s.proposals + (networkId to s.proposals[networkId].orEmpty().filter { it.key != proposal.key })) }
+        notifyChange()
+    }
+
+    /** Eşik dolmuş ve sırrı bu cihazda olan davetler: paylaşılacak bağlantılar. */
+    fun readyInvites(networkId: String): List<String> {
+        val rt = runtimes[networkId]?.takeIf { it.managed } ?: return emptyList()
+        val log = logs[networkId] ?: return emptyList()
+        val keys = log.keys ?: return emptyList()
+        val definition = log.definition ?: return emptyList()
+        return state.proposals[networkId].orEmpty().mapNotNull { it.ticket }
+            .filter { it.validSignerCount(keys) >= keys.threshold && it.inviteId in state.inviteSecrets && it.expiresAt > System.currentTimeMillis() }
+            .map { t -> ManagedLinks.encode(ManagedJoin(networkId, rt.network.secret, definition.name, definition.entryMode, t, state.inviteSecrets[t.inviteId])) }
+    }
+
+    /**
+     * Gelen veya yerel öneriyi birleştirir. Yalnız geçerli imzalar tutulur: sahte imzayla eşik
+     * doldurulamaz, geçersiz öneri yayılmaz. Bayat olay düşer; böylece iki öneriden yalnız biri
+     * zincire girer ve yöneticiler çatallanmaz.
+     */
+    private fun mergeProposal(networkId: String, incoming: Proposal) {
+        val log = logs[networkId] ?: return
+        var finished: GovernanceEvent? = null
+        synchronized(log) {
+            val keys = log.keys ?: return
+            val existing = state.proposals[networkId].orEmpty()
+            val merged: Proposal = incoming.event?.let { e ->
+                if (e.networkId != networkId || e.type !in GovernanceTypes.ALLOWED || e.type == GovernanceTypes.GENESIS) return
+                if (e.sequence != log.nextSequence || e.prevHash != log.lastHash) return
+                val before = existing.firstOrNull { it.key == e.hash() }?.event?.signatures.orEmpty()
+                val all = (before + e.signatures).distinctBy { it.key }.filter { s -> e.copy(signatures = listOf(s)).validSignerCount(keys) == 1 }
+                if (all.isEmpty()) return
+                val event = e.copy(signatures = all)
+                if (event.validSignerCount(keys) >= keys.threshold) finished = event
+                Proposal(event = event)
+            } ?: incoming.ticket?.let { t ->
+                if (t.networkId != networkId || t.expiresAt <= System.currentTimeMillis() || t.inviteId in log.revokedInvites) return
+                val before = existing.firstOrNull { it.ticket?.inviteId == t.inviteId }?.ticket?.signatures.orEmpty()
+                val all = (before + t.signatures).distinctBy { it.key }.filter { s -> t.copy(signatures = listOf(s)).validSignerCount(keys) == 1 }
+                if (all.isEmpty()) return
+                Proposal(ticket = t.copy(signatures = all))
+            } ?: return
+            val others = existing.filter { it.key != merged.key }
+            val list = if (finished != null) others else (others + merged).takeLast(MAX_PROPOSALS)
+            mutate { s -> s.copy(proposals = s.proposals + (networkId to list)) }
+        }
+        finished?.let { e ->
+            try {
+                submitGovernance(networkId, e)
+                pruneProposals(networkId)
+            } catch (r: GovernanceRejected) {
+                governanceAlerts[networkId] = r.reason
+            }
+        }
+        notifyChange()
+    }
+
+    /** Zincir ilerleyince eski sıradaki öneriler geçersizdir. */
+    private fun pruneProposals(networkId: String) {
+        val log = logs[networkId] ?: return
+        val time = System.currentTimeMillis()
+        mutate { s ->
+            s.copy(proposals = s.proposals + (networkId to s.proposals[networkId].orEmpty().filter { p ->
+                p.event?.let { it.sequence == log.nextSequence && it.prevHash == log.lastHash } ?: (p.ticket?.expiresAt?.let { it > time } == true)
+            }))
+        }
+    }
+
+    private fun exchangeProposals(ch: SecureChannel, rt: NetRuntime, initiator: Boolean, accept: Boolean) {
+        if (!rt.managed) return
+        fun push() = ch.send(Msg.GovProposals(state.proposals[rt.id].orEmpty()))
+        fun pull() {
+            val incoming = ch.receiveControl() as? Msg.GovProposals ?: throw ProtocolException("Öneriler bekleniyordu")
+            if (accept) incoming.proposals.take(MAX_PROPOSALS).forEach { mergeProposal(rt.id, it) }
+        }
+        if (initiator) {
+            push()
+            pull()
+        } else {
+            pull()
+            push()
+        }
+    }
+
+    /** İmzalı olayı uygular. Geçersizse [GovernanceRejected] atar. Yayılma eşitlemeyle olur. */
+    fun submitGovernance(networkId: String, event: GovernanceEvent) {
+        val log = logs[networkId] ?: throw IllegalArgumentException("Yönetilen ağ değil")
+        synchronized(log) {
+            log.apply(event)
+            mutate { s -> s.copy(governance = s.governance + (networkId to log.events)) }
+        }
+        pruneProposals(networkId)
+        when (event.type) {
+            GovernanceTypes.SECRET_ROTATE -> applySecretRotation(networkId, event)
+            GovernanceTypes.KEY_ROTATION -> adoptAdminKey(networkId)
+        }
+        notifyChange()
+    }
+
+    /** Yeni sete eklendiyse koddaki anahtar bu ağın yönetici anahtarı olur. Çıkarıldıysa anahtar işe yaramaz. */
+    private fun adoptAdminKey(networkId: String) {
+        val keys = logs[networkId]?.keys ?: return
+        val pool = state.adminKeyPool
+        if (pool.isEmpty() || networkId in state.adminKeys) return
+        if (platformCrypto.ed25519PublicOf(pool.unhex()).hex() !in keys.keys) return
+        mutate { it.copy(adminKeys = it.adminKeys + (networkId to pool), adminKeyPool = "") }
+    }
+
+    private fun secretPrologue(networkId: String, epoch: Int) = "LD-SECRET-1|$networkId|$epoch".encodeToByteArray()
+
+    private fun applySecretRotation(networkId: String, event: GovernanceEvent) {
+        val rt = runtimes[networkId] ?: return
+        val rotation = GovernanceLog.decodeRotation(event.payload) ?: return
+        val prologue = secretPrologue(networkId, rotation.epoch)
+        val fresh = rotation.sealed.firstNotNullOfOrNull { entry ->
+            runCatching { Noise.open(rt.staticPriv, prologue, entry.unhex()).plain.hex() }.getOrNull()
+        }
+        val current = rt.network
+        val updated = if (fresh != null) {
+            current.copy(secret = fresh, previousSecret = current.secret, previousUntil = System.currentTimeMillis() + config.secretGraceMs, secretMissed = false)
+        } else {
+            current.copy(secretMissed = true)
+        }
+        rt.network = updated
+        mutate { s -> s.copy(networks = s.networks.map { if (it.networkId == networkId) updated else it }) }
+    }
+
+    /** Bu cihaz yeni sırrı alamadı: iptal edildi veya yöneticiler onu tanımıyordu. */
+    fun secretMissed(networkId: String): Boolean = runtimes[networkId]?.network?.secretMissed == true
+
+    /**
+     * Ağ sırrını yeniler. Yeni sır, bilinen ve iptal edilmemiş her üyeye ayrı mühürlenir. Yöneticinin
+     * hiç görmediği üye sırrı alamaz, yeniden davet ister. Dönüş: mühür sayısı.
+     */
+    fun proposeSecretRotation(networkId: String): Int {
+        val rt = runtimes[networkId] ?: throw IllegalArgumentException("Ağ bulunamadı")
+        val log = logs[networkId] ?: throw IllegalArgumentException("Yönetilen ağ değil")
+        val epoch = synchronized(log) { log.secretEpoch } + 1
+        val fresh = platformCrypto.randomBytes(32)
+        val prologue = secretPrologue(networkId, epoch)
+        val recipients = (mesh.contacts(networkId).filter { sha256(it.box.unhex()).hex() !in log.revokedMembers }.map { it.box.unhex() } + listOf(Noise.publicOf(rt.staticPriv))).distinctBy { it.hex() }
+        val sealed = recipients.map { Noise.seal(it, rt.staticPriv, prologue, fresh).hex() }.shuffled()
+        proposeEvent(networkId, GovernanceTypes.SECRET_ROTATE, GovernanceLog.encode(SecretRotation(epoch, sealed)))
+        return sealed.size
+    }
+
+    /** Yönetim anahtarlarını değiştirir. Eski setin eşiğiyle onaylanır; Network ID değişmez (Bölüm 11.3). */
+    fun proposeKeyRotation(networkId: String, adminCodes: List<String>, threshold: Int = 2) {
+        val set = ManagementKeySet(threshold, adminCodes.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.distinct())
+        require(set.isValid()) { "En az $threshold farklı geçerli yönetici kodu gerekir" }
+        proposeEvent(networkId, GovernanceTypes.KEY_ROTATION, GovernanceLog.encode(RotationPayload(set)))
+    }
+
+    /** Bu ağdaki kendi yönetici kodu; yönetici değilse null. */
+    fun ownAdminCode(networkId: String): String? = state.adminKeys[networkId]?.let { platformCrypto.ed25519PublicOf(it.unhex()).hex() }
+
+    fun witnessSummary(networkId: String, contactId: String, required: Int = MeshEngine.DEFAULT_WITNESSES): WitnessSummary =
+        mesh.witnessSummary(networkId, contactId, required)
+
+    fun governance(networkId: String): GovernanceLog? = logs[networkId]
+
+    /** Zincir eşitlemesinde reddedilen son olayın nedeni: çatallanma veya sahte olay görünür olsun. */
+    fun governanceAlert(networkId: String): GovernanceReject? = governanceAlerts[networkId]
+
+    fun setMembership(networkId: String, proof: MembershipProof) {
+        mutate { it.copy(memberships = it.memberships + (networkId to proof)) }
+        notifyChange()
+    }
+
+    /** Davet kodunu bu ağdaki kendi kimliğine bağlar. */
+    fun redeemInvite(networkId: String, ticket: InviteTicket, secret: String) {
+        val rt = runtimes[networkId] ?: throw IllegalArgumentException("Ağ bulunamadı")
+        setMembership(networkId, Invites.redeem(ticket, secret, rt.fingerprint, System.currentTimeMillis()))
+    }
+
+    private enum class Access { FULL, READ, NONE }
+
+    private fun accessOf(rt: NetRuntime, hello: Msg.Hello, fingerprint: String): Access {
+        if (!rt.managed) return Access.FULL
+        val log = logs[rt.id] ?: return Access.READ
+        return synchronized(log) {
+            val definition = log.definition
+            when {
+                log.mode == ManagementMode.RETIRED -> Access.NONE
+                // Zincir henüz gelmedi: kuralı bilmeden yazma kabul edilmez.
+                definition == null -> Access.READ
+                hello.admin != null && Invites.verifyAdmin(hello.admin, log, fingerprint) && fingerprint !in log.revokedMembers -> Access.FULL
+                fingerprint in log.revokedMembers -> Access.NONE
+                definition.entryMode == EntryMode.OPEN -> Access.FULL
+                hello.membership != null && Invites.verify(hello.membership, log, fingerprint) && countInviteUse(rt.id, hello.membership) -> Access.FULL
+                // Olağan anahtar değişimi tanınan üyeleri kapı dışında bırakmasın: bu düğüm onları eski
+                // bir davetle saymıştı. İptal edilen davet veya kişi bu kuralın dışındadır.
+                state.inviteUses.any { (k, v) -> k.startsWith("${rt.id}|") && k.substringAfter('|') !in log.revokedInvites && fingerprint in v } -> Access.FULL
+                definition.entryMode == EntryMode.MIXED -> Access.READ
+                else -> Access.NONE
+            }
+        }
+    }
+
+    /** Bu düğümün gördüğü kullanımlar: kotayı aşan yeni kimlik reddedilir, eskiler geçerli kalır. */
+    private fun countInviteUse(networkId: String, proof: MembershipProof): Boolean = synchronized(lock) {
+        val key = "$networkId|${proof.ticket.inviteId}"
+        val used = state.inviteUses[key].orEmpty()
+        if (proof.memberFingerprint in used) return@synchronized true
+        if (used.size >= proof.ticket.maxUses) return@synchronized false
+        mutate { it.copy(inviteUses = it.inviteUses + (key to used + proof.memberFingerprint)) }
+        true
+    }
+
+    /** Sırayla gönderir: iki taraf aynı anda yazıp TCP tamponunda kilitlenmesin. */
+    private fun exchangeGovernance(ch: SecureChannel, rt: NetRuntime, initiator: Boolean) {
+        if (!rt.managed) return
+        val log = logs[rt.id] ?: return
+        val mine = synchronized(log) { log.events }
+        ch.send(Msg.GovHave(mine.size.toLong(), mine.lastOrNull()?.hash() ?: ""))
+        val theirs = ch.receiveControl() as? Msg.GovHave ?: throw ProtocolException("Zincir durumu bekleniyordu")
+        val sameBase = theirs.count == 0L || (theirs.count <= mine.size && mine[(theirs.count - 1).toInt()].hash() == theirs.lastHash)
+        val outgoing = if (sameBase && theirs.count < mine.size) mine.drop(theirs.count.toInt()) else emptyList()
+        // Aynı noktada farklı olay: yöneticiler çatallanmış. Üstüne yazılmaz, görünür kılınır (Bölüm 17).
+        if (!sameBase && theirs.count <= mine.size) governanceAlerts[rt.id] = GovernanceReject.FORK
+        fun push() = ch.send(Msg.GovEvents(outgoing))
+        fun pull() {
+            val incoming = ch.receiveControl() as? Msg.GovEvents ?: throw ProtocolException("Zincir bekleniyordu")
+            if (incoming.events.size > GOV_MAX_EVENTS) throw ProtocolException("Çok fazla olay")
+            for (event in incoming.events) {
+                try {
+                    submitGovernance(rt.id, event)
+                } catch (e: GovernanceRejected) {
+                    governanceAlerts[rt.id] = e.reason
+                    notifyChange()
+                    return
+                }
+            }
+        }
+        // Erişimi olmayana zinciri verip kapatırken son paket Bluetooth'ta düşebilir: karşı taraf
+        // aldığını bildirmeden bağlantı kapanmasın. Emeklilik bilgisi böyle kayboluyordu.
+        if (initiator) {
+            push()
+            pull()
+            ch.send(Msg.MeshEnd)
+        } else {
+            pull()
+            push()
+            ch.receiveControl() as? Msg.MeshEnd ?: throw ProtocolException("Onay bekleniyordu")
+        }
     }
 
     // ---- Ağ yönetimi ----
@@ -249,12 +671,18 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     /** Ağdan çıkış her zaman serbesttir; kimlik ve bu ağın aktarım kayıtları silinir. */
     fun leaveNetwork(id: String) {
         runtimes.remove(id)?.let { runCatching { it.server.close() } }
+        logs.remove(id)
         peers.keys.removeIf { it.startsWith("$id|") }
         transfers.values.filter { it.networkId == id }.forEach { transfers.remove(it.id) }
         mesh.remove(id)
         mutate { s ->
             s.copy(
-                networks = s.networks.filter { NetCode.networkId(it.code).hex() != id },
+                networks = s.networks.filter { it.networkId != id },
+                governance = s.governance - id,
+                memberships = s.memberships - id,
+                inviteUses = s.inviteUses.filterKeys { !it.startsWith("$id|") },
+                adminKeys = s.adminKeys - id,
+                proposals = s.proposals - id,
                 trusted = s.trusted.filter { it.networkId != id },
                 history = s.history.filter { it.networkId != id },
                 mesh = s.mesh - id,
@@ -263,7 +691,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         notifyChange()
     }
 
-    private fun info(rt: NetRuntime) = NetworkInfo(rt.id, rt.network.code, rt.network.name, rt.fingerprint, rt.server.localPort)
+    private fun info(rt: NetRuntime) = NetworkInfo(rt.id, rt.network.code, rt.network.name, rt.fingerprint, rt.server.localPort, rt.managed)
 
     fun networks(): List<NetworkInfo> = runtimes.values.sortedBy { it.network.createdAt }.map { info(it) }
 
@@ -351,12 +779,29 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         return true
     }
 
+    /**
+     * LoRa çerçevesini ağ sırrı açar; sır iptal edilen kişide de kalır. Bu yüzden yazarın durumu
+     * ayrıca denetlenir. Karma ağda sır herkese açık olduğundan yalnız tanınan üyeler kabul edilir.
+     */
+    private fun loraAuthorAllowed(rt: NetRuntime, wire: MeshWire): Boolean {
+        if (!rt.managed) return true
+        val log = logs[rt.id] ?: return false
+        if (log.mode == ManagementMode.RETIRED) return false
+        val definition = log.definition ?: return false
+        val contact = mesh.contacts(rt.id).firstOrNull { wire.author.isNotEmpty() && it.id == sha256(wire.author.unhex()).hex() }
+        val fingerprint = contact?.let { sha256(it.box.unhex()).hex() } ?: wire.takeIf { it.kind == MeshEngine.KIND_PRESENCE }?.let { mesh.presenceFingerprint(rt.id, it) }
+        if (fingerprint != null && fingerprint in log.revokedMembers) return false
+        if (definition.entryMode != EntryMode.MIXED) return true
+        return fingerprint != null && state.inviteUses.any { (k, v) -> k.startsWith("${rt.id}|") && fingerprint in v }
+    }
+
     /** LoRa'dan gelen çerçeve. Bu ağların hiçbirine ait değilse yok sayılır. */
     fun receiveLoraFrame(frame: ByteArray) {
         for (rt in runtimes.values) {
-            val fragment = LoraCodec.open(rt.loraKey, frame) ?: continue
+            val fragment = rt.keysets().firstNotNullOfOrNull { LoraCodec.open(it.lora, frame) } ?: continue
             val data = loraReassembler.add(rt.id, fragment) ?: return
             val wire = LoraCodec.decodeWire(data) ?: return
+            if (!loraAuthorAllowed(rt, wire)) return
             mesh.ingest(rt.id, wire.copy(hops = (wire.hops - 1).coerceAtLeast(0)))
             notifyChange()
             return
@@ -371,6 +816,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     fun isContactVerified(networkId: String, contact: MeshContact): Boolean =
         contact.proven && state.trusted.any { it.networkId == networkId && it.fingerprint == sha256(contact.box.unhex()).hex() }
 
+    fun contactFingerprint(contact: MeshContact): String = sha256(contact.box.unhex()).hex()
+
     fun meshCarried(networkId: String): Int = mesh.carriedCount(networkId)
 
     fun meshOwnId(networkId: String): String? = mesh.ownId(networkId)
@@ -383,6 +830,11 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
 
     // ---- Platform taşımaları (Bluetooth vb.) ----
 
+    fun setTheme(theme: String) {
+        mutate { it.copy(theme = theme) }
+        notifyChange()
+    }
+
     fun setBluetoothEnabled(enabled: Boolean) {
         mutate { it.copy(bluetoothEnabled = enabled) }
         notifyChange()
@@ -392,6 +844,12 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     fun bleTokens(networkId: String, epoch: Long, tolerance: Int): List<ByteArray> {
         val rt = runtimes[networkId] ?: return emptyList()
         return (-tolerance..tolerance).map { NetCode.bleToken(rt.discKey, epoch + it) }
+    }
+
+    /** Taramada tanınacak belirteçler ve anahtar sıraları: geçiş süresinde eski sırrınkiler de. */
+    fun bleTokensIndexed(networkId: String, epoch: Long, tolerance: Int): List<Pair<ByteArray, Int>> {
+        val rt = runtimes[networkId] ?: return emptyList()
+        return rt.keysets().flatMapIndexed { index, keys -> (-tolerance..tolerance).map { NetCode.bleToken(keys.disc, epoch + it) to index } }
     }
 
     fun meshVersion(networkId: String): Long = mesh.version(networkId)
@@ -408,7 +866,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     }
 
     /** Bağlantı üzerinden mesh eşitlemesi yapar. Başarısızsa istisna atar; bağlantıyı kapatır. */
-    fun syncOverLink(networkId: String, link: Link) {
+    /** [keyIndex], reklamı açan anahtarın sırası: karşı taraf eski sırdaysa o anahtarla bağlanılır. */
+    fun syncOverLink(networkId: String, link: Link, keyIndex: Int = 0) {
         val rt = runtimes[networkId]
         if (rt == null) {
             link.close()
@@ -416,10 +875,11 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         }
         link.setTimeout(config.handshakeTimeoutMs)
         try {
-            SecureChannel.handshake(link, true, rt.staticPriv, rt.psk, rt.idBytes).use { ch ->
+            val keys = rt.keysets()
+            SecureChannel.handshake(link, true, rt.staticPriv, keys.getOrElse(keyIndex) { keys.first() }.psk, rt.idBytes).use { ch ->
                 if (ch.remoteFingerprint in state.blockedPeers) return
-                exchangeHello(ch, PURPOSE_MESH)
-                meshExchange(ch, rt, true)
+                val hello = exchangeHello(ch, PURPOSE_MESH, rt)
+                meshExchange(ch, rt, true, hello)
             }
         } finally {
             link.close()
@@ -470,13 +930,29 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         }
     }
 
+    /** Karşı taraf henüz yeni sırrı almamış olabilir: geçiş süresinde eski anahtarla da denenir. */
+    private fun dial(rt: NetRuntime, host: String, port: Int): SecureChannel {
+        var failure: Exception? = null
+        for (keys in rt.keysets()) {
+            val socket = Socket()
+            try {
+                socket.soTimeout = config.handshakeTimeoutMs
+                socket.connect(InetSocketAddress(host, port), config.handshakeTimeoutMs)
+                return SecureChannel.handshake(socket, true, rt.staticPriv, keys.psk, rt.idBytes)
+            } catch (e: IOException) {
+                failure = e
+            } catch (e: NoiseException) {
+                failure = e
+            }
+            runCatching { socket.close() }
+        }
+        throw failure ?: IOException("anahtar yok")
+    }
+
     private fun meshSyncTo(rt: NetRuntime, peerKey: String, fp: String, address: String) {
         val host = address.substringBeforeLast(':')
         val port = address.substringAfterLast(':').toInt()
-        val socket = Socket()
-        socket.soTimeout = config.handshakeTimeoutMs
-        socket.connect(InetSocketAddress(host, port), config.handshakeTimeoutMs)
-        SecureChannel.handshake(socket, true, rt.staticPriv, rt.psk, rt.idBytes).use { ch ->
+        dial(rt, host, port).use { ch ->
             if (ch.remoteFingerprint != fp || fp in state.blockedPeers) return
             // Canlı doğrulanmış adres korunur: eş iki adresten ulaşılabilirse liste oynamasın.
             val current = verifiedAddress[peerKey]
@@ -486,20 +962,25 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
                 verifiedAddress[peerKey] = address
                 peers.computeIfPresent(peerKey) { _, p -> p.copy(host = host, port = port) }
             }
-            exchangeHello(ch, PURPOSE_MESH)
-            meshExchange(ch, rt, true)
+            val hello = exchangeHello(ch, PURPOSE_MESH, rt)
+            meshExchange(ch, rt, true, hello)
         }
     }
 
     /** İki taraf sırayla gönderir, böylece TCP tamponları dolunca kilitlenme olmaz. */
-    private fun meshExchange(ch: SecureChannel, rt: NetRuntime, initiator: Boolean) {
+    private fun meshExchange(ch: SecureChannel, rt: NetRuntime, initiator: Boolean, hello: Msg.Hello) {
         ch.setTimeout(config.ioTimeoutMs)
+        // Zincir önce gelir: giriş kuralı ve emeklilik bilgisi üye olmayana da ulaşsın.
+        exchangeGovernance(ch, rt, initiator)
+        val access = accessOf(rt, hello, ch.remoteFingerprint)
+        if (access == Access.NONE) throw ProtocolException("Bu ağa erişim yok")
+        exchangeProposals(ch, rt, initiator, access == Access.FULL)
         val mine = mesh.inventory(rt.id)
         // Önce yalnız özet: boşta geçen eşitleme tüm kimlik listesini taşımasın.
         val digest = sha256(mine.sorted().joinToString("").toByteArray()).hex()
         ch.send(Msg.MeshInv(emptyList(), mesh.selfPresence(rt.id), digest))
         val first = ch.receiveControl() as? Msg.MeshInv ?: throw ProtocolException("Envanter bekleniyordu")
-        mesh.acceptLinkPresence(rt.id, first.self, ch.remoteFingerprint)
+        if (access == Access.FULL) mesh.acceptLinkPresence(rt.id, first.self, ch.remoteFingerprint)
         if (first.digest == digest) {
             if (initiator) ch.send(Msg.MeshEnd) else runCatching { ch.receiveControl() }
             notifyChange()
@@ -520,7 +1001,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
                     is Msg.MeshPush -> {
                         received += m.items.size
                         if (received > MESH_MAX_PUSH) throw ProtocolException("Çok fazla zarf")
-                        m.items.forEach { mesh.ingest(rt.id, it) }
+                        // Karma modda onaysız kişi okur ama yazamaz.
+                        if (access == Access.FULL) m.items.forEach { mesh.ingest(rt.id, it) }
                     }
                     is Msg.MeshEnd -> return
                     else -> throw ProtocolException("Beklenmeyen mesaj")
@@ -647,7 +1129,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
                 continue
             }
             for (rt in runtimes.values) {
-                val p = Beacon.open(rt.discKey, packet.data, packet.length) ?: continue
+                val p = rt.keysets().firstNotNullOfOrNull { Beacon.open(it.disc, packet.data, packet.length) } ?: continue
                 if (p.fp == rt.fingerprint) break
                 val key = "${rt.id}|${p.fp}"
                 val host = packet.address.hostAddress ?: ""
@@ -670,9 +1152,14 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
     private fun sendBeacons(socket: DatagramSocket) {
         val targets = broadcastAddresses().map { InetSocketAddress(it, config.discoveryPort) } + config.extraBeaconTargets
         for (rt in runtimes.values) {
-            val packet = Beacon.seal(rt.discKey, Beacon.Payload(rt.server.localPort, rt.fingerprint, state.nick))
-            for (target in targets) {
-                runCatching { socket.send(DatagramPacket(packet, packet.size, target)) }
+            // Emekli edilen ağ kendini duyurmaz; eşitleme yine de sonlandığını yayabilir.
+            if (logs[rt.id]?.mode == ManagementMode.RETIRED) continue
+            // Geçiş süresinde eski sırla da duyurulur: henüz güncellenmemiş üye yeni sırrı alabilsin.
+            for (keys in rt.keysets()) {
+                val packet = Beacon.seal(keys.disc, Beacon.Payload(rt.server.localPort, rt.fingerprint, state.nick))
+                for (target in targets) {
+                    runCatching { socket.send(DatagramPacket(packet, packet.size, target)) }
+                }
             }
         }
     }
@@ -742,16 +1229,14 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         val id = initial.id
         val manifest = Manifest.build(file, config.chunkSize)
         update(id) { it.copy(fileHash = manifest.fileHash, chunksTotal = manifest.chunkHashes.size, status = TransferStatus.CONNECTING) }
-        val socket = Socket()
-        socket.soTimeout = config.handshakeTimeoutMs
-        socket.connect(InetSocketAddress(initial.peerHost, initial.peerPort), config.handshakeTimeoutMs)
-        SecureChannel.handshake(socket, true, rt.staticPriv, rt.psk, rt.idBytes).use { ch ->
+        dial(rt, initial.peerHost!!, initial.peerPort).use { ch ->
             if (initial.peerFp.isNotEmpty() && initial.peerFp != ch.remoteFingerprint) {
                 throw ProtocolException("Karşı tarafın kimliği değişmiş")
             }
             if (ch.remoteFingerprint in state.blockedPeers) throw ProtocolException("Bu kişi engellenmiş")
             update(id) { it.copy(peerFp = ch.remoteFingerprint, sas = ch.sas) }
-            val hello = exchangeHello(ch, PURPOSE_TRANSFER)
+            val hello = exchangeHello(ch, PURPOSE_TRANSFER, rt)
+            if (accessOf(rt, hello, ch.remoteFingerprint) != Access.FULL) throw ProtocolException("Karşı taraf bu ağın üyesi değil")
             update(id) { it.copy(peerNick = sanitizeNick(hello.nick)) }
             pair(ch, rt, id)
 
@@ -850,7 +1335,7 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         link.setTimeout(config.handshakeTimeoutMs)
         val alarm = deadlines.schedule({ link.close() }, config.handshakeTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
         return try {
-            SecureChannel.handshake(link, false, rt.staticPriv, rt.psk, rt.idBytes)
+            SecureChannel.accept(link, rt.staticPriv, rt.keysets().map { it.psk }, rt.idBytes)
         } catch (_: Exception) {
             link.close()
             null
@@ -865,12 +1350,13 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
             ch.use {
                 // Engellenen kişi fark edilmeden kapatılır.
                 if (ch.remoteFingerprint in state.blockedPeers) return
-                val hello = exchangeHello(ch, PURPOSE_TRANSFER)
+                val hello = exchangeHello(ch, PURPOSE_TRANSFER, rt)
                 if (hello.purpose == PURPOSE_MESH) {
                     // Ağ kodu üyeliği kanıtlar; zarflar kendi imza veya mührünü taşır. Soru sorulmaz.
-                    meshExchange(ch, rt, false)
+                    meshExchange(ch, rt, false, hello)
                     return
                 }
+                if (accessOf(rt, hello, ch.remoteFingerprint) != Access.FULL) return
                 val t = Transfer(
                     id = UUID.randomUUID().toString(), networkId = rt.id, outgoing = false, peerFp = ch.remoteFingerprint,
                     peerNick = sanitizeNick(hello.nick), fileName = "", status = TransferStatus.CONNECTING, sas = ch.sas,
@@ -1020,8 +1506,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
 
     // ---- Ortak adımlar ----
 
-    private fun exchangeHello(ch: SecureChannel, purpose: String): Msg.Hello {
-        ch.send(Msg.Hello(PROTOCOL_VERSION, state.nick, purpose))
+    private fun exchangeHello(ch: SecureChannel, purpose: String, rt: NetRuntime): Msg.Hello {
+        ch.send(Msg.Hello(PROTOCOL_VERSION, state.nick, purpose, state.memberships[rt.id], state.adminKeys[rt.id]?.let { Invites.adminProof(it.unhex(), rt.id, rt.fingerprint) }))
         val hello = ch.receiveControl() as? Msg.Hello ?: throw ProtocolException("Selamlaşma bekleniyordu")
         if (hello.proto != PROTOCOL_VERSION) throw ProtocolException("Protokol sürümü uyumsuz")
         return hello
@@ -1129,6 +1615,8 @@ class Node(private val dir: File, private val store: StateStore, val config: Nod
         const val MAX_HANDSHAKES_PER_SOURCE = 4
         const val MAX_PROMPTS = 4
         const val MAX_HISTORY = 200
+        private const val GOV_MAX_EVENTS = 1000
+        private const val MAX_PROPOSALS = 32
         private const val MAX_ADDRESSES_TRIED = 4
         private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     }

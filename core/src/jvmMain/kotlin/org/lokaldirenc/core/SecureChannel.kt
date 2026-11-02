@@ -155,6 +155,36 @@ class SecureChannel internal constructor(
             return SecureChannel(link, hs.split())
         }
 
+        /**
+         * Yanıtlayan taraf: sır değişiminin geçiş süresinde birden çok anahtar geçerlidir. İlk mesajı
+         * hangisi açıyorsa oturum onunla sürer. Hiçbiri açmazsa yanıt verilmez.
+         */
+        fun accept(link: Link, staticPriv: ByteArray, psks: List<ByteArray>, networkId: ByteArray): SecureChannel {
+            val input = DataInputStream(link.input)
+            val output = DataOutputStream(link.output)
+            fun read(): ByteArray {
+                val size = input.readUnsignedShort()
+                if (size > MAX_HANDSHAKE) throw NoiseException("el sıkışma mesajı çok büyük")
+                return ByteArray(size).also { input.readFully(it) }
+            }
+            val first = read()
+            val hs = psks.firstNotNullOfOrNull { psk ->
+                val candidate = Noise.Handshake(false, staticPriv, psk, prologue(networkId))
+                try {
+                    candidate.read(first)
+                    candidate
+                } catch (_: NoiseException) {
+                    null
+                }
+            } ?: throw NoiseException("ağ anahtarı tutmuyor")
+            val reply = hs.write()
+            output.writeShort(reply.size)
+            output.write(reply)
+            output.flush()
+            hs.read(read())
+            return SecureChannel(link, hs.split())
+        }
+
         private const val MAX_HANDSHAKE = 256
     }
 }
